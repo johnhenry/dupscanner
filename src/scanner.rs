@@ -73,9 +73,9 @@ impl Scanner {
         }
     }
 
-    pub fn scan<F>(&mut self, progress_callback: F) -> Result<HashMap<u64, Vec<FileInfo>>>
+    pub fn scan<F>(&mut self, mut progress_callback: F) -> Result<HashMap<u64, Vec<FileInfo>>>
     where
-        F: Fn(usize, &Path),
+        F: FnMut(usize, &Path),
     {
         let walker = WalkDir::new(&self.config.root_path)
             .follow_links(false)
