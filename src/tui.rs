@@ -2,16 +2,16 @@ use crate::app::{App, AppState};
 use crate::suggestions::SuggestionEngine;
 use anyhow::Result;
 use crossterm::{
-    event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyModifiers},
+    event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use ratatui::{
-    backend::{Backend, CrosstermBackend},
+    backend::CrosstermBackend,
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
-    text::{Line, Span, Text},
-    widgets::{Block, Borders, List, ListItem, Paragraph, Wrap},
+    text::{Line, Span},
+    widgets::{Block, Borders, List, ListItem, Paragraph},
     Frame, Terminal,
 };
 use std::io;
@@ -169,7 +169,7 @@ async fn scan_files<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Re
     Ok(())
 }
 
-fn ui<B: Backend>(f: &mut Frame, app: &App) {
+fn ui(f: &mut Frame, app: &App) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -200,7 +200,7 @@ fn ui<B: Backend>(f: &mut Frame, app: &App) {
     render_footer(f, chunks[2], app);
 }
 
-fn render_header<B: Backend>(f: &mut Frame, area: Rect, app: &App) {
+fn render_header(f: &mut Frame, area: Rect, app: &App) {
     let title = match app.state {
         AppState::Scanning => "Scanning for Files",
         AppState::FindingDuplicates => "Finding Duplicates",
@@ -216,7 +216,7 @@ fn render_header<B: Backend>(f: &mut Frame, area: Rect, app: &App) {
     f.render_widget(header, area);
 }
 
-fn render_footer<B: Backend>(f: &mut Frame, area: Rect, app: &App) {
+fn render_footer(f: &mut Frame, area: Rect, app: &App) {
     let footer_text = if let Some(msg) = &app.status_message {
         msg.clone()
     } else {
@@ -237,7 +237,7 @@ fn render_footer<B: Backend>(f: &mut Frame, area: Rect, app: &App) {
     f.render_widget(footer, area);
 }
 
-fn render_scanning<B: Backend>(f: &mut Frame, area: Rect, app: &App) {
+fn render_scanning(f: &mut Frame, area: Rect, app: &App) {
     let text = vec![
         Line::from(vec![
             Span::raw("Scanned: "),
@@ -269,7 +269,7 @@ fn render_scanning<B: Backend>(f: &mut Frame, area: Rect, app: &App) {
     f.render_widget(paragraph, area);
 }
 
-fn render_finding_duplicates<B: Backend>(f: &mut Frame, area: Rect, app: &App) {
+fn render_finding_duplicates(f: &mut Frame, area: Rect, app: &App) {
     let text = vec![
         Line::from("Finding duplicate files..."),
         Line::from(""),
@@ -289,7 +289,7 @@ fn render_finding_duplicates<B: Backend>(f: &mut Frame, area: Rect, app: &App) {
     f.render_widget(paragraph, area);
 }
 
-fn render_duplicates<B: Backend>(f: &mut Frame, area: Rect, app: &App) {
+fn render_duplicates(f: &mut Frame, area: Rect, app: &App) {
     let chunks = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(30), Constraint::Percentage(70)])
@@ -302,7 +302,7 @@ fn render_duplicates<B: Backend>(f: &mut Frame, area: Rect, app: &App) {
     render_files_panel(f, chunks[1], app);
 }
 
-fn render_groups_panel<B: Backend>(f: &mut Frame, area: Rect, app: &App) {
+fn render_groups_panel(f: &mut Frame, area: Rect, app: &App) {
     let groups = app.finder.groups();
 
     if groups.is_empty() {
@@ -345,7 +345,7 @@ fn render_groups_panel<B: Backend>(f: &mut Frame, area: Rect, app: &App) {
     f.render_widget(list, area);
 }
 
-fn render_files_panel<B: Backend>(f: &mut Frame, area: Rect, app: &App) {
+fn render_files_panel(f: &mut Frame, area: Rect, app: &App) {
     if let Some(group) = app.current_group() {
         let suggestions = SuggestionEngine::suggest_deletions(&group.files);
 
@@ -404,7 +404,7 @@ fn render_files_panel<B: Backend>(f: &mut Frame, area: Rect, app: &App) {
     }
 }
 
-fn render_help<B: Backend>(f: &mut Frame, area: Rect) {
+fn render_help(f: &mut Frame, area: Rect) {
     let help_text = vec![
         Line::from(""),
         Line::from(Span::styled("Navigation", Style::default().add_modifier(Modifier::BOLD))),
@@ -434,7 +434,7 @@ fn render_help<B: Backend>(f: &mut Frame, area: Rect) {
     f.render_widget(help, area);
 }
 
-fn render_completed<B: Backend>(f: &mut Frame, area: Rect, app: &App) {
+fn render_completed(f: &mut Frame, area: Rect, app: &App) {
     let text = vec![
         Line::from(Span::styled("Scan Complete!", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD))),
         Line::from(""),

@@ -1,6 +1,6 @@
 use crate::backup::BackupManager;
 use crate::duplicates::{DuplicateFinder, DuplicateGroup};
-use crate::scanner::{FileInfo, ScanConfig, Scanner};
+use crate::scanner::{ScanConfig, Scanner};
 use crate::state::{get_default_state_file, ScanState};
 use crate::suggestions::SuggestionEngine;
 use anyhow::Result;

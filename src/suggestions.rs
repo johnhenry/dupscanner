@@ -1,5 +1,4 @@
 use crate::scanner::FileInfo;
-use std::cmp::Ordering;
 use std::path::Path;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
