@@ -84,6 +84,7 @@ impl BackupManager {
         Ok(backup_path)
     }
 
+    #[allow(dead_code)]
     pub fn restore_file(&self, backup_path: &Path, restore_path: Option<&Path>) -> Result<()> {
         let record = self
             .records
@@ -111,10 +112,12 @@ impl BackupManager {
         Ok(())
     }
 
+    #[allow(dead_code)]
     pub fn list_backups(&self) -> &[BackupRecord] {
         &self.records
     }
 
+    #[allow(dead_code)]
     pub fn clean_old_backups(&mut self, days: i64) -> Result<usize> {
         let cutoff = Utc::now() - chrono::Duration::days(days);
         let mut removed_count = 0;
@@ -136,6 +139,7 @@ impl BackupManager {
         Ok(removed_count)
     }
 
+    #[allow(dead_code)]
     pub fn get_total_backup_size(&self) -> u64 {
         self.records.iter().map(|r| r.size).sum()
     }

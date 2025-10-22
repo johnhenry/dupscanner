@@ -32,25 +32,6 @@ impl DuplicateGroup {
         self.files.len()
     }
 
-    pub fn remove_file(&mut self, index: usize) -> Option<FileInfo> {
-        if index < self.files.len() {
-            let file = self.files.remove(index);
-            self.update_stats();
-            Some(file)
-        } else {
-            None
-        }
-    }
-
-    fn update_stats(&mut self) {
-        self.total_size = self.files.iter().map(|f| f.size).sum();
-        self.wasted_space = if self.files.is_empty() {
-            0
-        } else {
-            self.files[0].size * (self.files.len() as u64 - 1)
-        };
-    }
-
     pub fn is_empty(&self) -> bool {
         self.files.len() <= 1
     }
@@ -107,49 +88,6 @@ impl DuplicateFinder {
         Ok(())
     }
 
-    pub fn add_files_from_size_group(&mut self, mut files: Vec<FileInfo>) -> Result<()> {
-        if files.len() < 2 {
-            return Ok(());
-        }
-
-        let mut hash_map: HashMap<String, Vec<FileInfo>> = HashMap::new();
-
-        for file in &mut files {
-            if let Ok(hash) = file.get_or_compute_hash() {
-                hash_map
-                    .entry(hash.to_string())
-                    .or_insert_with(Vec::new)
-                    .push(file.clone());
-            }
-        }
-
-        for (hash, files) in hash_map {
-            if files.len() > 1 {
-                // Check if group already exists
-                if let Some(existing_group) = self.groups.iter_mut().find(|g| g.hash == hash) {
-                    // Merge files
-                    for file in files {
-                        if !existing_group.files.iter().any(|f| f.path == file.path) {
-                            existing_group.files.push(file);
-                        }
-                    }
-                    existing_group.update_stats();
-                } else {
-                    // Create new group
-                    let group = DuplicateGroup::new(hash, files);
-                    self.total_duplicates += group.file_count();
-                    self.total_wasted_space += group.wasted_space;
-                    self.groups.push(group);
-                }
-            }
-        }
-
-        // Re-sort groups
-        self.groups.sort_by(|a, b| b.wasted_space.cmp(&a.wasted_space));
-
-        Ok(())
-    }
-
     pub fn groups(&self) -> &[DuplicateGroup] {
         &self.groups
     }
@@ -158,6 +96,7 @@ impl DuplicateFinder {
         &mut self.groups
     }
 
+    #[allow(dead_code)]
     pub fn total_duplicates(&self) -> usize {
         self.total_duplicates
     }

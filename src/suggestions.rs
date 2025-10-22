@@ -12,6 +12,7 @@ pub enum SuggestionReason {
 }
 
 impl SuggestionReason {
+    #[allow(dead_code)]
     pub fn description(&self) -> &str {
         match self {
             SuggestionReason::DeeperPath => "Deeper in directory tree",
@@ -38,6 +39,7 @@ impl SuggestionReason {
 #[derive(Debug, Clone)]
 pub struct FileSuggestion {
     pub file_index: usize,
+    #[allow(dead_code)]
     pub reasons: Vec<SuggestionReason>,
     pub score: u32,
 }
@@ -164,6 +166,7 @@ impl SuggestionEngine {
         }
     }
 
+    #[allow(dead_code)]
     pub fn sort_by_preference(files: &mut [FileInfo]) {
         files.sort_by(|a, b| {
             // Prefer files that are NOT in temp/downloads

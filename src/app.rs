@@ -11,7 +11,6 @@ pub enum AppState {
     Scanning,
     FindingDuplicates,
     ReviewingDuplicates,
-    Completed,
 }
 
 pub struct App {

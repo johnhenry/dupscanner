@@ -117,6 +117,7 @@ impl Scanner {
         Ok(self.size_groups.clone())
     }
 
+    #[allow(dead_code)]
     pub fn get_potential_duplicates(&self) -> Vec<&Vec<FileInfo>> {
         self.size_groups
             .values()
@@ -124,6 +125,7 @@ impl Scanner {
             .collect()
     }
 
+    #[allow(dead_code)]
     pub fn scanned_count(&self) -> usize {
         self.scanned_count
     }

@@ -43,18 +43,6 @@ impl ScanState {
         Ok(state)
     }
 
-    pub fn update_from_scanner(
-        &mut self,
-        size_groups: HashMap<u64, Vec<FileInfo>>,
-        scanned_count: usize,
-        total_size: u64,
-    ) {
-        self.size_groups = size_groups;
-        self.scanned_count = scanned_count;
-        self.total_size = total_size;
-        self.timestamp = Utc::now();
-    }
-
     pub fn update_from_finder(&mut self, finder: &DuplicateFinder) {
         self.duplicate_groups = finder.groups().to_vec();
         self.timestamp = Utc::now();

@@ -122,12 +122,6 @@ async fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Resul
                             }
                         }
                     }
-                    AppState::Completed => {
-                        match key.code {
-                            KeyCode::Char('q') => return Ok(()),
-                            _ => {}
-                        }
-                    }
                 }
 
                 // Clear status message on next keypress
@@ -193,7 +187,6 @@ fn ui(f: &mut Frame, app: &App) {
                 render_duplicates(f, chunks[1], app);
             }
         }
-        AppState::Completed => render_completed(f, chunks[1], app),
     }
 
     // Footer
@@ -205,7 +198,6 @@ fn render_header(f: &mut Frame, area: Rect, app: &App) {
         AppState::Scanning => "Scanning for Files",
         AppState::FindingDuplicates => "Finding Duplicates",
         AppState::ReviewingDuplicates => "Review Duplicate Files",
-        AppState::Completed => "Scan Complete",
     };
 
     let header = Paragraph::new(title)
@@ -432,22 +424,6 @@ fn render_help(f: &mut Frame, area: Rect) {
         .alignment(Alignment::Left);
 
     f.render_widget(help, area);
-}
-
-fn render_completed(f: &mut Frame, area: Rect, app: &App) {
-    let text = vec![
-        Line::from(Span::styled("Scan Complete!", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD))),
-        Line::from(""),
-        Line::from(format!("Total files scanned: {}", app.scanned_count)),
-        Line::from(format!("Duplicate groups found: {}", app.finder.groups().len())),
-        Line::from(format!("Total wasted space: {}", format_size(app.finder.total_wasted_space()))),
-    ];
-
-    let paragraph = Paragraph::new(text)
-        .block(Block::default().borders(Borders::ALL).title("Results"))
-        .alignment(Alignment::Center);
-
-    f.render_widget(paragraph, area);
 }
 
 fn format_size(bytes: u64) -> String {
