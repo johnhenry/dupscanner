@@ -1,7 +1,6 @@
 use anyhow::{Context, Result};
 use rand::Rng;
 use std::fs;
-use std::io::Write;
 use std::path::Path;
 
 pub fn generate_demo_data(base_path: &Path, num_files: usize, duplicates_per_file: usize) -> Result<()> {
@@ -87,7 +86,7 @@ pub fn generate_demo_data(base_path: &Path, num_files: usize, duplicates_per_fil
         ("pictures/metadata.json", r#"{"camera": "Canon", "date": "2024-01-15"}"#),
     ];
 
-    for (path, content) in unique_files {
+    for (path, content) in &unique_files {
         let file_path = base_path.join(path);
         fs::write(&file_path, content)?;
         total_files += 1;
