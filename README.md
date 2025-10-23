@@ -102,8 +102,8 @@ dupscanner list
 
 ### Actions
 - `Space` - Toggle mark file for deletion
-- `a` - Auto-mark suggested files (based on intelligent algorithm)
-- `o` - Mark all except oldest file
+- `a` - Auto-mark suggested files (smart: marks bad locations/names, always keeps best file)
+- `o` - Mark all except oldest (aggressive: keeps only the oldest/best file)
 - `d` - Delete marked files (creates backup first)
 - `s` - Save current state
 

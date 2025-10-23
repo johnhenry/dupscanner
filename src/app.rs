@@ -143,11 +143,17 @@ impl App {
         if let Some(group) = self.current_group() {
             let suggestions = SuggestionEngine::suggest_deletions(&group.files);
 
+            // Get the best file to keep
+            let keeper_index = SuggestionEngine::get_best_keeper(&group.files);
+
             self.marked_for_deletion = vec![false; group.files.len()];
 
             for suggestion in suggestions {
+                // Mark for deletion, but never mark the keeper
                 if suggestion.file_index < self.marked_for_deletion.len() {
-                    self.marked_for_deletion[suggestion.file_index] = true;
+                    if Some(suggestion.file_index) != keeper_index {
+                        self.marked_for_deletion[suggestion.file_index] = true;
+                    }
                 }
             }
         }
