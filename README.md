@@ -45,6 +45,23 @@ cargo install --path .
 
 ## Usage
 
+### Demo Mode (Quick Start)
+```bash
+# Generate demo test data with duplicates
+dupscanner demo
+
+# This creates test data in /tmp/dupscanner-demo with:
+# - 10 unique files with 3 duplicates each
+# - Files in various folders (documents, downloads, temp, backup)
+# - Different naming patterns to test suggestion algorithm
+
+# Customize demo data generation
+dupscanner demo /path/to/demo --num-files 20 --duplicates 5
+
+# Then scan the demo data
+dupscanner scan /tmp/dupscanner-demo
+```
+
 ### Basic Scan
 ```bash
 # Scan a directory

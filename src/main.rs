@@ -1,5 +1,6 @@
 mod app;
 mod backup;
+mod demo;
 mod duplicates;
 mod scanner;
 mod state;
@@ -52,6 +53,21 @@ enum Commands {
 
     /// List saved scan states
     List,
+
+    /// Generate demo test data with duplicates
+    Demo {
+        /// Directory to create test data in
+        #[arg(value_name = "PATH", default_value = "/tmp/dupscanner-demo")]
+        path: PathBuf,
+
+        /// Number of unique files to create
+        #[arg(short = 'n', long, default_value = "10")]
+        num_files: usize,
+
+        /// Number of duplicates per file
+        #[arg(short = 'd', long, default_value = "3")]
+        duplicates: usize,
+    },
 }
 
 #[tokio::main]
@@ -89,6 +105,9 @@ async fn main() -> Result<()> {
         }
         Commands::List => {
             list_saved_states()?;
+        }
+        Commands::Demo { path, num_files, duplicates } => {
+            demo::generate_demo_data(&path, num_files, duplicates)?;
         }
     }
 
