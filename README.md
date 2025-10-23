@@ -80,6 +80,63 @@ dupscanner scan /path/to/directory --save-state
 dupscanner scan /path/to/directory --resume
 ```
 
+### YOLO Mode (Automatic Non-Interactive)
+```bash
+# ⚠️ YOLO MODE: Automatically delete duplicates without confirmation
+# Scans, finds duplicates, and deletes them in real-time
+# ALWAYS keeps the best file (oldest, best location, no "copy" in name)
+# ALL deletions are backed up before removal
+
+dupscanner scan /path/to/directory --yolo
+
+# Example: Clean demo data automatically
+dupscanner demo
+dupscanner scan /tmp/dupscanner-demo --yolo
+
+# YOLO with size constraints
+dupscanner scan ~/Downloads --yolo --min-size 1048576  # Only files >1MB
+```
+
+**How YOLO Mode Works:**
+1. Scans directory for files
+2. Groups files by size, then by hash
+3. For each duplicate group, uses intelligent algorithm to pick best file to keep:
+   - Prefers files NOT in temp/ or downloads/
+   - Prefers files without "copy", "backup", "duplicate" in name
+   - Prefers shallower paths (closer to root)
+   - Prefers older files
+4. Deletes all duplicates except the keeper
+5. Backs up all deleted files to `~/.local/share/dupscanner/backups/`
+6. Shows real-time output of what's being deleted
+
+**Output Example:**
+```
+🚀 YOLO MODE ACTIVATED
+   Scanning and auto-deleting duplicates in real-time...
+   Path: /tmp/dupscanner-demo
+
+📊 Scanning files...
+   Scanned: 43 files, Deleted: 0 duplicates
+
+🔍 Finding and removing duplicates...
+
+   Found 4 duplicates (hash: a3f2b1c9...)
+   ✓ Keeping: /tmp/dupscanner-demo/documents/file_0.txt
+   ✗ Deleted: /tmp/dupscanner-demo/downloads/file_0.txt
+   ✗ Deleted: /tmp/dupscanner-demo/temp/file_0_temp.txt
+   ✗ Deleted: /tmp/dupscanner-demo/backup/file_0_copy.txt
+
+✅ YOLO mode complete!
+
+📊 Summary:
+   Files scanned: 43
+   Duplicates deleted: 30
+   Space freed: 234.56 KB
+   Backups location: ~/.local/share/dupscanner/backups/
+
+💡 Tip: All deleted files were backed up and can be restored if needed.
+```
+
 ### Resume from State File
 ```bash
 # Resume latest scan
