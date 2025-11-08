@@ -47,9 +47,11 @@ Weighted scoring system to identify best file to keep:
 - **Always keeps the best file**: Never auto-deletes without suggestion
 
 #### 7. **Safety Features** 🛡️
-- Automatic backup before deletion
+- **Trash by default**: Files moved to system recycle bin (easily recoverable)
+- **Optional backup mode**: Copy files before deletion with `--use-backup`
 - All deletions are reversible
-- Backup location: `~/.local/share/dupscanner/backups/`
+- Trash location: System recycle bin (Trash on macOS, Recycle Bin on Windows, Trash on Linux)
+- Backup location: `~/.local/share/dupscanner/backups/` (when using --use-backup)
 - State persistence for crash recovery
 - Manual file selection with visual feedback
 
@@ -129,16 +131,24 @@ dupscanner scan /path/to/directory \
 # ⚠️ YOLO MODE: Automatically delete duplicates without confirmation
 # Scans, finds duplicates, and deletes them in real-time
 # ALWAYS keeps the best file (oldest, best location, no "copy" in name)
-# ALL deletions are backed up before removal
+# By default: Moves files to system trash (easily recoverable)
 
 dupscanner scan /path/to/directory --yolo
 
-# Example: Clean demo data automatically
+# Example: Clean demo data automatically (uses trash by default)
 dupscanner demo
 dupscanner scan /tmp/dupscanner-demo --yolo
 
+# YOLO with backup mode instead of trash
+dupscanner scan /path/to/directory --yolo --use-backup
+
 # YOLO with size constraints
 dupscanner scan ~/Downloads --yolo --min-size 1048576  # Only files >1MB
+
+# YOLO with exclusion patterns
+dupscanner scan ~/Documents --yolo \
+  --exclude "*.tmp" \
+  --exclude "*/node_modules/*"
 ```
 
 **How YOLO Mode Works:**
@@ -150,32 +160,48 @@ dupscanner scan ~/Downloads --yolo --min-size 1048576  # Only files >1MB
    - Prefers shallower paths (closer to root)
    - Prefers older files
 4. Deletes all duplicates except the keeper
-5. Backs up all deleted files to `~/.local/share/dupscanner/backups/`
-6. Shows real-time output of what's being deleted
+5. **Default**: Moves files to system trash (macOS Trash, Windows Recycle Bin, Linux Trash)
+6. **Optional**: Use `--use-backup` to copy files to `~/.local/share/dupscanner/backups/` instead
+7. Shows real-time output of what's being deleted
 
-**Output Example:**
+**Output Example (Trash Mode - Default):**
 ```
 🚀 YOLO MODE ACTIVATED
    Scanning and auto-deleting duplicates in real-time...
    Path: /tmp/dupscanner-demo
+   Min size: 1 B
+   Deletion method: Trash (move to system recycle bin)
 
 📊 Scanning files...
-   Scanned: 43 files, Deleted: 0 duplicates
+   ✓ Scanned: 43 files in 0.12s
 
 🔍 Finding and removing duplicates...
 
-   Found 4 duplicates (hash: a3f2b1c9...)
+   Found 4 duplicates (8.45 KiB, hash: a3f2b1c9...)
    ✓ Keeping: /tmp/dupscanner-demo/documents/file_0.txt
-   ✗ Deleted: /tmp/dupscanner-demo/downloads/file_0.txt
-   ✗ Deleted: /tmp/dupscanner-demo/temp/file_0_temp.txt
-   ✗ Deleted: /tmp/dupscanner-demo/backup/file_0_copy.txt
+   Moved to trash: /tmp/dupscanner-demo/downloads/file_0.txt
+   Moved to trash: /tmp/dupscanner-demo/temp/file_0_temp.txt
+   Moved to trash: /tmp/dupscanner-demo/backup/file_0_copy.txt
 
 ✅ YOLO mode complete!
 
 📊 Summary:
    Files scanned: 43
    Duplicates deleted: 30
-   Space freed: 234.56 KB
+   Space freed: 234.56 KiB
+   Total time: 0.45s
+   Files location: System trash/recycle bin
+
+💡 Tip: All deleted files are in your system trash and can be restored from there.
+```
+
+**Output Example (Backup Mode - with --use-backup):**
+```
+🚀 YOLO MODE ACTIVATED
+   Deletion method: Backup (copy to ~/.local/share/dupscanner/backups/)
+   ...
+   Deleted (backed up): /tmp/dupscanner-demo/downloads/file_0.txt
+   ...
    Backups location: ~/.local/share/dupscanner/backups/
 
 💡 Tip: All deleted files were backed up and can be restored if needed.

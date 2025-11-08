@@ -51,6 +51,10 @@ enum Commands {
         /// Exclude patterns (glob format, can be specified multiple times)
         #[arg(short = 'e', long = "exclude", value_name = "PATTERN")]
         exclude: Vec<String>,
+
+        /// Use backup instead of trash (backup creates copies, trash moves to system recycle bin)
+        #[arg(long)]
+        use_backup: bool,
     },
 
     /// Resume a previous scan
@@ -92,10 +96,11 @@ async fn main() -> Result<()> {
             resume,
             yolo,
             exclude,
+            use_backup,
         } => {
             if yolo {
                 // YOLO mode: non-interactive real-time duplicate removal
-                yolo_scan(path, min_size, max_size, exclude).await?;
+                yolo_scan(path, min_size, max_size, exclude, use_backup).await?;
             } else if resume {
                 // Try to resume from default state file
                 let state_file = state::get_default_state_file(&path)?;
@@ -179,7 +184,7 @@ fn list_saved_states() -> Result<()> {
     Ok(())
 }
 
-async fn yolo_scan(path: PathBuf, min_size: u64, max_size: u64, exclude_patterns: Vec<String>) -> Result<()> {
+async fn yolo_scan(path: PathBuf, min_size: u64, max_size: u64, exclude_patterns: Vec<String>, use_backup: bool) -> Result<()> {
     use backup::BackupManager;
     use colored::Colorize;
     use humansize::{format_size, BINARY};
@@ -198,6 +203,14 @@ async fn yolo_scan(path: PathBuf, min_size: u64, max_size: u64, exclude_patterns
     if !exclude_patterns.is_empty() {
         println!("   {}: {}", "Excluding".bold().yellow(), exclude_patterns.join(", ").dimmed());
     }
+    println!("   {}: {}",
+        "Deletion method".bold(),
+        if use_backup {
+            "Backup (copy to ~/.local/share/dupscanner/backups/)".cyan()
+        } else {
+            "Trash (move to system recycle bin)".green()
+        }
+    );
     println!();
 
     let start_time = Instant::now();
@@ -302,9 +315,18 @@ async fn yolo_scan(path: PathBuf, min_size: u64, max_size: u64, exclude_patterns
                     continue;
                 }
 
-                match backup_manager.delete_with_backup(&file.path) {
+                let result = if use_backup {
+                    // Use backup method (copy then delete)
+                    backup_manager.delete_with_backup(&file.path).map(|_| ())
+                } else {
+                    // Use trash (move to recycle bin)
+                    trash::delete(&file.path).map_err(|e| anyhow::anyhow!("Failed to move to trash: {}", e))
+                };
+
+                match result {
                     Ok(_) => {
-                        println!("   {} {}", "✗ Deleted:".red().bold(), file.path.display().to_string().dimmed());
+                        let method = if use_backup { "Deleted (backed up):" } else { "Moved to trash:" };
+                        println!("   {} {}", method.red().bold(), file.path.display().to_string().dimmed());
                         total_deleted += 1;
                         total_space_freed += file.size;
                     }
@@ -338,11 +360,20 @@ async fn yolo_scan(path: PathBuf, min_size: u64, max_size: u64, exclude_patterns
     println!("   {}: {:.2}s",
         "Total time".bold(),
         total_elapsed.as_secs_f64());
-    println!("   {}: {}",
-        "Backups location".bold(),
-        "~/.local/share/dupscanner/backups/".dimmed());
-    println!();
-    println!("{} {}", "💡".bright_yellow(), "Tip: All deleted files were backed up and can be restored if needed.".dimmed());
+
+    if use_backup {
+        println!("   {}: {}",
+            "Backups location".bold(),
+            "~/.local/share/dupscanner/backups/".dimmed());
+        println!();
+        println!("{} {}", "💡".bright_yellow(), "Tip: All deleted files were backed up and can be restored if needed.".dimmed());
+    } else {
+        println!("   {}: {}",
+            "Files location".bold(),
+            "System trash/recycle bin".dimmed());
+        println!();
+        println!("{} {}", "💡".bright_yellow(), "Tip: All deleted files are in your system trash and can be restored from there.".dimmed());
+    }
 
     Ok(())
 }
