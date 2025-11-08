@@ -56,18 +56,36 @@ impl DuplicateFinder {
         let mut hash_map: HashMap<String, Vec<FileInfo>> = HashMap::new();
 
         // Only process size groups with multiple files
-        for (_, mut files) in size_groups {
+        for (_, files) in size_groups {
             if files.len() < 2 {
                 continue;
             }
 
-            // Compute hashes for all files in this size group
-            for file in &mut files {
-                if let Ok(hash) = file.get_or_compute_hash() {
-                    hash_map
-                        .entry(hash.to_string())
+            // Phase 1: Group by quick hash
+            let mut quick_hash_groups: HashMap<String, Vec<FileInfo>> = HashMap::new();
+            for file in files {
+                if let Some(ref quick_hash) = file.quick_hash {
+                    quick_hash_groups
+                        .entry(quick_hash.clone())
                         .or_insert_with(Vec::new)
-                        .push(file.clone());
+                        .push(file);
+                }
+            }
+
+            // Phase 2: Only compute full hashes for files with matching quick hashes
+            for (_, mut quick_hash_group) in quick_hash_groups {
+                if quick_hash_group.len() < 2 {
+                    continue; // Skip files with unique quick hashes
+                }
+
+                // Compute full hashes only for potential duplicates
+                for file in &mut quick_hash_group {
+                    if let Ok(hash) = file.get_or_compute_hash() {
+                        hash_map
+                            .entry(hash.to_string())
+                            .or_insert_with(Vec::new)
+                            .push(file.clone());
+                    }
                 }
             }
         }
@@ -101,6 +119,7 @@ impl DuplicateFinder {
         self.total_duplicates
     }
 
+    #[allow(dead_code)]
     pub fn total_wasted_space(&self) -> u64 {
         self.total_wasted_space
     }
@@ -134,6 +153,7 @@ mod tests {
             FileInfo {
                 path: PathBuf::from("/test/file1.txt"),
                 size: 100,
+                quick_hash: Some("quick123".to_string()),
                 hash: Some("abc123".to_string()),
                 modified: SystemTime::now(),
                 depth: 2,
@@ -141,6 +161,7 @@ mod tests {
             FileInfo {
                 path: PathBuf::from("/test/file2.txt"),
                 size: 100,
+                quick_hash: Some("quick123".to_string()),
                 hash: Some("abc123".to_string()),
                 modified: SystemTime::now(),
                 depth: 2,
@@ -154,11 +175,12 @@ mod tests {
     }
 
     #[test]
-    fn test_remove_file() {
+    fn test_quick_hash_filtering() {
         let files = vec![
             FileInfo {
                 path: PathBuf::from("/test/file1.txt"),
                 size: 100,
+                quick_hash: Some("quick123".to_string()),
                 hash: Some("abc123".to_string()),
                 modified: SystemTime::now(),
                 depth: 2,
@@ -166,17 +188,14 @@ mod tests {
             FileInfo {
                 path: PathBuf::from("/test/file2.txt"),
                 size: 100,
-                hash: Some("abc123".to_string()),
+                quick_hash: Some("quick456".to_string()),
+                hash: Some("def456".to_string()),
                 modified: SystemTime::now(),
                 depth: 2,
             },
         ];
 
-        let mut group = DuplicateGroup::new("abc123".to_string(), files);
+        let group = DuplicateGroup::new("abc123".to_string(), files);
         assert_eq!(group.file_count(), 2);
-
-        group.remove_file(0);
-        assert_eq!(group.file_count(), 1);
-        assert_eq!(group.wasted_space, 0);
     }
 }

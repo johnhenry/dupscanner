@@ -20,7 +20,8 @@ pub struct ScanConfig {
 pub struct FileInfo {
     pub path: PathBuf,
     pub size: u64,
-    pub hash: Option<String>,
+    pub quick_hash: Option<String>,  // Hash of first 64KB for fast comparison
+    pub hash: Option<String>,         // Full file hash (computed lazily)
     pub modified: SystemTime,
     pub depth: usize,
 }
@@ -36,6 +37,7 @@ impl FileInfo {
         Ok(FileInfo {
             path: path.to_path_buf(),
             size,
+            quick_hash: None,
             hash: None,
             modified,
             depth,
@@ -53,6 +55,20 @@ impl FileInfo {
             self.compute_hash()?;
         }
         Ok(self.hash.as_ref().unwrap())
+    }
+
+    pub fn compute_quick_hash(&mut self) -> Result<()> {
+        let hash = compute_quick_hash(&self.path)?;
+        self.quick_hash = Some(hash);
+        Ok(())
+    }
+
+    #[allow(dead_code)]
+    pub fn get_or_compute_quick_hash(&mut self) -> Result<&str> {
+        if self.quick_hash.is_none() {
+            self.compute_quick_hash()?;
+        }
+        Ok(self.quick_hash.as_ref().unwrap())
     }
 }
 
@@ -89,7 +105,7 @@ impl Scanner {
 
             let path = entry.path();
 
-            if let Ok(file_info) = FileInfo::from_path(path) {
+            if let Ok(mut file_info) = FileInfo::from_path(path) {
                 // Filter by size
                 if file_info.size < self.config.min_size {
                     continue;
@@ -99,6 +115,11 @@ impl Scanner {
                     if file_info.size > max_size {
                         continue;
                     }
+                }
+
+                // Compute quick hash during initial scan
+                if file_info.compute_quick_hash().is_err() {
+                    continue; // Skip files we can't hash
                 }
 
                 self.scanned_count += 1;
@@ -152,6 +173,20 @@ pub fn compute_file_hash(path: &Path) -> Result<String> {
     Ok(format!("{:x}", hasher.finalize()))
 }
 
+/// Compute quick hash of first 64KB of file for fast comparison
+pub fn compute_quick_hash(path: &Path) -> Result<String> {
+    let file = File::open(path).context("Failed to open file for quick hashing")?;
+    let mut reader = BufReader::new(file);
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0; 65536]; // 64KB buffer
+
+    // Read only first 64KB
+    let bytes_read = reader.read(&mut buffer)?;
+    hasher.update(&buffer[..bytes_read]);
+
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
 fn is_hidden(entry: &DirEntry) -> bool {
     entry
         .file_name()
@@ -193,5 +228,54 @@ mod tests {
         let hash1 = file_info.hash.clone();
         file_info.compute_hash().unwrap();
         assert_eq!(hash1, file_info.hash);
+    }
+
+    #[test]
+    fn test_quick_hash_computation() {
+        let temp_dir = TempDir::new().unwrap();
+        let file_path = temp_dir.path().join("test.txt");
+        let mut file = File::create(&file_path).unwrap();
+        file.write_all(b"test content").unwrap();
+
+        let mut file_info = FileInfo::from_path(&file_path).unwrap();
+        assert!(file_info.quick_hash.is_none());
+
+        file_info.compute_quick_hash().unwrap();
+        assert!(file_info.quick_hash.is_some());
+
+        // Quick hash should be consistent
+        let quick_hash1 = file_info.quick_hash.clone();
+        file_info.compute_quick_hash().unwrap();
+        assert_eq!(quick_hash1, file_info.quick_hash);
+    }
+
+    #[test]
+    fn test_quick_hash_vs_full_hash() {
+        let temp_dir = TempDir::new().unwrap();
+
+        // Create a small file (less than 64KB)
+        let small_file = temp_dir.path().join("small.txt");
+        let mut file = File::create(&small_file).unwrap();
+        file.write_all(b"small content").unwrap();
+
+        let mut small_info = FileInfo::from_path(&small_file).unwrap();
+        small_info.compute_quick_hash().unwrap();
+        small_info.compute_hash().unwrap();
+
+        // For small files, quick hash and full hash should be the same
+        assert_eq!(small_info.quick_hash, small_info.hash);
+
+        // Create a large file (more than 64KB)
+        let large_file = temp_dir.path().join("large.txt");
+        let mut file = File::create(&large_file).unwrap();
+        let large_content = vec![0u8; 128 * 1024]; // 128KB
+        file.write_all(&large_content).unwrap();
+
+        let mut large_info = FileInfo::from_path(&large_file).unwrap();
+        large_info.compute_quick_hash().unwrap();
+        large_info.compute_hash().unwrap();
+
+        // For large files, quick hash and full hash should be different
+        assert_ne!(large_info.quick_hash, large_info.hash);
     }
 }

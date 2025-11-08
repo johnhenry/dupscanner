@@ -228,6 +228,7 @@ mod tests {
             FileInfo {
                 path: PathBuf::from("/home/user/file.txt"),
                 size: 100,
+                quick_hash: Some("quick123".to_string()),
                 hash: Some("abc".to_string()),
                 modified: SystemTime::now(),
                 depth: 3,
@@ -235,6 +236,7 @@ mod tests {
             FileInfo {
                 path: PathBuf::from("/tmp/file.txt"),
                 size: 100,
+                quick_hash: Some("quick123".to_string()),
                 hash: Some("abc".to_string()),
                 modified: SystemTime::now(),
                 depth: 2,
@@ -255,6 +257,7 @@ mod tests {
             FileInfo {
                 path: PathBuf::from("/home/user/file.txt"),
                 size: 100,
+                quick_hash: Some("quick123".to_string()),
                 hash: Some("abc".to_string()),
                 modified: SystemTime::now(),
                 depth: 3,
@@ -262,6 +265,7 @@ mod tests {
             FileInfo {
                 path: PathBuf::from("/tmp/file_copy.txt"),
                 size: 100,
+                quick_hash: Some("quick123".to_string()),
                 hash: Some("abc".to_string()),
                 modified: SystemTime::now(),
                 depth: 2,
