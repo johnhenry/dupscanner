@@ -31,11 +31,13 @@ A powerful, terminal-based duplicate file scanner written in Rust with an intuit
 - **Default**: 1000 files per batch
 
 #### 5. **SQLite Database Backend** 💾
-- Persistent storage of scan results
-- Full scan history with metadata
-- Quick access to past scans
+- Persistent storage of all scan results (both yolo and TUI modes)
+- Full scan history with metadata (timestamps, paths, file counts)
+- Quick access to past scans with `dupscanner history`
+- Review any completed scan with `dupscanner view <id>`
 - Integration-ready for web interface
 - **Schema**: scans, files, and indexes for performance
+- **Database location**: `~/.local/share/dupscanner/scans.db`
 
 #### 6. **Intelligent Suggestions** 🧠
 Weighted scoring system to identify best file to keep:
@@ -58,6 +60,8 @@ Weighted scoring system to identify best file to keep:
 ### Additional Features
 - **Interactive TUI**: Beautiful terminal interface with keyboard navigation
 - **YOLO Mode**: Fully automatic duplicate removal with real-time output
+- **Scan History**: Browse all past scans with `dupscanner history`
+- **Scan Review**: View details of any completed scan with `dupscanner view <id>`
 - **Pause & Resume**: Save scan state and continue later
 - **Demo Mode**: Generate realistic test data for testing
 - **Real-time Processing**: Review and delete duplicates as they're found
@@ -217,6 +221,31 @@ dupscanner resume /path/to/state.json
 
 # List saved scans
 dupscanner list
+```
+
+### Database & Scan History
+```bash
+# View scan history (all completed scans are saved to database)
+dupscanner history
+
+# View last 20 scans
+dupscanner history -n 20
+
+# View details of a specific scan
+dupscanner view 1
+
+# All scans (both yolo and TUI modes) are automatically saved to:
+# ~/.local/share/dupscanner/scans.db
+
+# Example workflow:
+# 1. Run a scan
+dupscanner scan ~/Downloads --yolo
+
+# 2. Check history
+dupscanner history
+
+# 3. View details of scan #1
+dupscanner view 1
 ```
 
 ## TUI Controls
