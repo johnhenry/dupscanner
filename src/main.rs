@@ -179,21 +179,26 @@ fn list_saved_states() -> Result<()> {
 
 async fn yolo_scan(path: PathBuf, min_size: u64, max_size: u64, exclude_patterns: Vec<String>) -> Result<()> {
     use backup::BackupManager;
+    use colored::Colorize;
+    use humansize::{format_size, BINARY};
     use scanner::{Scanner, ScanConfig};
     use std::collections::HashMap;
+    use std::time::Instant;
     use suggestions::SuggestionEngine;
 
-    println!("🚀 YOLO MODE ACTIVATED");
-    println!("   Scanning and auto-deleting duplicates in real-time...");
-    println!("   Path: {}", path.display());
-    println!("   Min size: {} bytes", min_size);
+    println!("{}", "🚀 YOLO MODE ACTIVATED".bold().bright_yellow());
+    println!("   {}", "Scanning and auto-deleting duplicates in real-time...".dimmed());
+    println!("   {}: {}", "Path".bold(), path.display());
+    println!("   {}: {}", "Min size".bold(), format_size(min_size, BINARY));
     if max_size > 0 {
-        println!("   Max size: {} bytes", max_size);
+        println!("   {}: {}", "Max size".bold(), format_size(max_size, BINARY));
     }
     if !exclude_patterns.is_empty() {
-        println!("   Excluding: {}", exclude_patterns.join(", "));
+        println!("   {}: {}", "Excluding".bold().yellow(), exclude_patterns.join(", ").dimmed());
     }
     println!();
+
+    let start_time = Instant::now();
 
     let config = ScanConfig {
         root_path: path,
@@ -211,23 +216,36 @@ async fn yolo_scan(path: PathBuf, min_size: u64, max_size: u64, exclude_patterns
     let mut total_deleted = 0;
     let mut total_space_freed: u64 = 0;
 
-    println!("📊 Scanning files...\n");
+    println!("{}", "📊 Scanning files...".bold().cyan());
+    println!();
+
+    let scan_start = Instant::now();
 
     // Scan and process duplicates in real-time
     let size_groups_result = scanner.scan(|count, _path| {
         total_scanned = count;
         if count % 100 == 0 {
-            print!("\r   Scanned: {} files, Deleted: {} duplicates", count, total_deleted);
+            let elapsed = scan_start.elapsed().as_secs_f64();
+            let rate = if elapsed > 0.0 { count as f64 / elapsed } else { 0.0 };
+            print!("\r   {} {} files ({:.1} files/sec)",
+                "Scanned:".bold(),
+                count.to_string().bright_green(),
+                rate);
             use std::io::Write;
             std::io::stdout().flush().unwrap();
         }
     })?;
 
-    println!("\r   Scanned: {} files, Deleted: {} duplicates", total_scanned, total_deleted);
+    let scan_elapsed = scan_start.elapsed();
+    println!("\r   {} {} files in {:.2}s",
+        "✓ Scanned:".bold().green(),
+        total_scanned.to_string().bright_green(),
+        scan_elapsed.as_secs_f64());
     println!();
 
     // Process size groups to find duplicates
-    println!("🔍 Finding and removing duplicates...\n");
+    println!("{}", "🔍 Finding and removing duplicates...".bold().cyan());
+    println!();
 
     for (_size, mut files) in size_groups_result {
         if files.len() < 2 {
@@ -266,9 +284,14 @@ async fn yolo_scan(path: PathBuf, min_size: u64, max_size: u64, exclude_patterns
 
             let keeper_index = keeper_index.unwrap();
             let keeper_path = group_files[keeper_index].path.display().to_string();
+            let file_size = group_files[0].size;
 
-            println!("   Found {} duplicates (hash: {}...)", group_files.len(), &hash[..8]);
-            println!("   ✓ Keeping: {}", keeper_path);
+            println!("   {} {} duplicates ({}, hash: {}...)",
+                "Found".bold(),
+                group_files.len().to_string().yellow(),
+                format_size(file_size, BINARY).dimmed(),
+                &hash[..8].dimmed());
+            println!("   {} {}", "✓ Keeping:".green().bold(), keeper_path);
 
             // Delete all files except the keeper
             for (i, file) in group_files.iter().enumerate() {
@@ -278,12 +301,15 @@ async fn yolo_scan(path: PathBuf, min_size: u64, max_size: u64, exclude_patterns
 
                 match backup_manager.delete_with_backup(&file.path) {
                     Ok(_) => {
-                        println!("   ✗ Deleted: {}", file.path.display());
+                        println!("   {} {}", "✗ Deleted:".red().bold(), file.path.display().to_string().dimmed());
                         total_deleted += 1;
                         total_space_freed += file.size;
                     }
                     Err(e) => {
-                        eprintln!("   ⚠ Failed to delete {}: {}", file.path.display(), e);
+                        eprintln!("   {} {}: {}",
+                            "⚠ Failed to delete".yellow().bold(),
+                            file.path.display(),
+                            e.to_string().dimmed());
                     }
                 }
             }
@@ -293,30 +319,27 @@ async fn yolo_scan(path: PathBuf, min_size: u64, max_size: u64, exclude_patterns
     }
 
     // Print summary
-    println!("✅ YOLO mode complete!\n");
-    println!("📊 Summary:");
-    println!("   Files scanned: {}", total_scanned);
-    println!("   Duplicates deleted: {}", total_deleted);
-    println!("   Space freed: {}", format_size(total_space_freed));
-    println!("   Backups location: ~/.local/share/dupscanner/backups/");
+    let total_elapsed = start_time.elapsed();
+    println!("{}", "✅ YOLO mode complete!".bold().bright_green());
     println!();
-    println!("💡 Tip: All deleted files were backed up and can be restored if needed.");
+    println!("{}", "📊 Summary:".bold());
+    println!("   {}: {}",
+        "Files scanned".bold(),
+        total_scanned.to_string().bright_cyan());
+    println!("   {}: {}",
+        "Duplicates deleted".bold(),
+        total_deleted.to_string().bright_red());
+    println!("   {}: {}",
+        "Space freed".bold(),
+        format_size(total_space_freed, BINARY).bright_green());
+    println!("   {}: {:.2}s",
+        "Total time".bold(),
+        total_elapsed.as_secs_f64());
+    println!("   {}: {}",
+        "Backups location".bold(),
+        "~/.local/share/dupscanner/backups/".dimmed());
+    println!();
+    println!("{} {}", "💡".bright_yellow(), "Tip: All deleted files were backed up and can be restored if needed.".dimmed());
 
     Ok(())
-}
-
-fn format_size(bytes: u64) -> String {
-    const KB: u64 = 1024;
-    const MB: u64 = KB * 1024;
-    const GB: u64 = MB * 1024;
-
-    if bytes >= GB {
-        format!("{:.2} GB", bytes as f64 / GB as f64)
-    } else if bytes >= MB {
-        format!("{:.2} MB", bytes as f64 / MB as f64)
-    } else if bytes >= KB {
-        format!("{:.2} KB", bytes as f64 / KB as f64)
-    } else {
-        format!("{} B", bytes)
-    }
 }
