@@ -1,4 +1,5 @@
 use crate::backup::BackupManager;
+use crate::database::ScanDatabase;
 use crate::duplicates::{DuplicateFinder, DuplicateGroup};
 use crate::scanner::{ScanConfig, Scanner};
 use crate::state::{get_default_state_file, ScanState};
@@ -18,6 +19,8 @@ pub struct App {
     pub scanner: Option<Scanner>,
     pub finder: DuplicateFinder,
     pub backup_manager: BackupManager,
+    pub database: Option<ScanDatabase>,
+    pub scan_id: Option<i64>,
     pub state: AppState,
     pub current_group_index: usize,
     pub scanned_count: usize,
@@ -30,17 +33,36 @@ pub struct App {
     pub status_message: Option<String>,
 }
 
+fn get_default_db_path() -> Result<PathBuf> {
+    let data_dir = dirs::data_local_dir()
+        .ok_or_else(|| anyhow::anyhow!("Could not determine local data directory"))?;
+    let app_dir = data_dir.join("dupscanner");
+    std::fs::create_dir_all(&app_dir)?;
+    Ok(app_dir.join("scans.db"))
+}
+
 impl App {
     pub fn new(config: ScanConfig) -> Self {
         let scanner = Some(Scanner::new(config.clone()));
         let mut backup_manager = BackupManager::new().unwrap_or_default();
         let _ = backup_manager.load_records();
 
+        // Open database and create scan record
+        let (database, scan_id) = get_default_db_path()
+            .and_then(|db_path| ScanDatabase::open(&db_path))
+            .and_then(|db| {
+                let scan_id = db.start_scan(&config.root_path)?;
+                Ok((Some(db), Some(scan_id)))
+            })
+            .unwrap_or((None, None));
+
         App {
             config,
             scanner,
             finder: DuplicateFinder::new(),
             backup_manager,
+            database,
+            scan_id,
             state: AppState::Scanning,
             current_group_index: 0,
             scanned_count: 0,
@@ -77,19 +99,31 @@ impl App {
     }
 
     pub fn save_state(&self) -> Result<()> {
-        if !self.config.save_state {
-            return Ok(());
+        // Save to JSON state file if requested
+        if self.config.save_state {
+            let state_file = get_default_state_file(&self.config.root_path)?;
+
+            let mut scan_state = ScanState::new(self.config.clone());
+            scan_state.scanned_count = self.scanned_count;
+            scan_state.total_size = self.total_size;
+            scan_state.completed = self.scan_complete;
+            scan_state.update_from_finder(&self.finder);
+
+            scan_state.save(&state_file)?;
         }
 
-        let state_file = get_default_state_file(&self.config.root_path)?;
+        // Save to database if scan is complete
+        if self.scan_complete {
+            if let (Some(ref db), Some(scan_id)) = (&self.database, self.scan_id) {
+                // Save all duplicate groups
+                for group in self.finder.groups() {
+                    let _ = db.save_duplicate_group(scan_id, group);
+                }
 
-        let mut scan_state = ScanState::new(self.config.clone());
-        scan_state.scanned_count = self.scanned_count;
-        scan_state.total_size = self.total_size;
-        scan_state.completed = self.scan_complete;
-        scan_state.update_from_finder(&self.finder);
-
-        scan_state.save(&state_file)?;
+                // Complete the scan
+                let _ = db.complete_scan(scan_id, self.scanned_count, self.finder.groups().len());
+            }
+        }
 
         Ok(())
     }
