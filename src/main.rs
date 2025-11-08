@@ -46,6 +46,10 @@ enum Commands {
         /// YOLO mode: automatically delete duplicates in real-time (keeps best file)
         #[arg(long)]
         yolo: bool,
+
+        /// Exclude patterns (glob format, can be specified multiple times)
+        #[arg(short = 'e', long = "exclude", value_name = "PATTERN")]
+        exclude: Vec<String>,
     },
 
     /// Resume a previous scan
@@ -86,10 +90,11 @@ async fn main() -> Result<()> {
             save_state,
             resume,
             yolo,
+            exclude,
         } => {
             if yolo {
                 // YOLO mode: non-interactive real-time duplicate removal
-                yolo_scan(path, min_size, max_size).await?;
+                yolo_scan(path, min_size, max_size, exclude).await?;
             } else if resume {
                 // Try to resume from default state file
                 let state_file = state::get_default_state_file(&path)?;
@@ -97,10 +102,10 @@ async fn main() -> Result<()> {
                     resume_scan(state_file).await?;
                 } else {
                     eprintln!("No previous scan state found for this directory");
-                    start_new_scan(path, min_size, max_size, save_state).await?;
+                    start_new_scan(path, min_size, max_size, save_state, exclude).await?;
                 }
             } else {
-                start_new_scan(path, min_size, max_size, save_state).await?;
+                start_new_scan(path, min_size, max_size, save_state, exclude).await?;
             }
         }
         Commands::Resume { state_file } => {
@@ -127,12 +132,14 @@ async fn start_new_scan(
     min_size: u64,
     max_size: u64,
     save_state: bool,
+    exclude_patterns: Vec<String>,
 ) -> Result<()> {
     let config = scanner::ScanConfig {
         root_path: path,
         min_size,
         max_size: if max_size == 0 { None } else { Some(max_size) },
         save_state,
+        exclude_patterns,
     };
 
     let mut app = app::App::new(config);
@@ -170,7 +177,7 @@ fn list_saved_states() -> Result<()> {
     Ok(())
 }
 
-async fn yolo_scan(path: PathBuf, min_size: u64, max_size: u64) -> Result<()> {
+async fn yolo_scan(path: PathBuf, min_size: u64, max_size: u64, exclude_patterns: Vec<String>) -> Result<()> {
     use backup::BackupManager;
     use scanner::{Scanner, ScanConfig};
     use std::collections::HashMap;
@@ -183,6 +190,9 @@ async fn yolo_scan(path: PathBuf, min_size: u64, max_size: u64) -> Result<()> {
     if max_size > 0 {
         println!("   Max size: {} bytes", max_size);
     }
+    if !exclude_patterns.is_empty() {
+        println!("   Excluding: {}", exclude_patterns.join(", "));
+    }
     println!();
 
     let config = ScanConfig {
@@ -190,6 +200,7 @@ async fn yolo_scan(path: PathBuf, min_size: u64, max_size: u64) -> Result<()> {
         min_size,
         max_size: if max_size == 0 { None } else { Some(max_size) },
         save_state: false,
+        exclude_patterns,
     };
 
     let mut scanner = Scanner::new(config);

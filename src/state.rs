@@ -139,6 +139,7 @@ mod tests {
             min_size: 1,
             max_size: None,
             save_state: true,
+            exclude_patterns: vec![],
         };
 
         let state = ScanState::new(config);

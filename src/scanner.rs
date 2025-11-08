@@ -14,6 +14,7 @@ pub struct ScanConfig {
     pub min_size: u64,
     pub max_size: Option<u64>,
     pub save_state: bool,
+    pub exclude_patterns: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
@@ -105,6 +106,11 @@ impl Scanner {
 
             let path = entry.path();
 
+            // Check if path should be excluded
+            if should_exclude(path, &self.config.exclude_patterns) {
+                continue;
+            }
+
             if let Ok(mut file_info) = FileInfo::from_path(path) {
                 // Filter by size
                 if file_info.size < self.config.min_size {
@@ -118,9 +124,7 @@ impl Scanner {
                 }
 
                 // Compute quick hash during initial scan
-                if file_info.compute_quick_hash().is_err() {
-                    continue; // Skip files we can't hash
-                }
+                let _ = file_info.compute_quick_hash(); // Best effort - continue even if it fails
 
                 self.scanned_count += 1;
                 self.total_size += file_info.size;
@@ -193,6 +197,29 @@ fn is_hidden(entry: &DirEntry) -> bool {
         .to_str()
         .map(|s| s.starts_with('.'))
         .unwrap_or(false)
+}
+
+fn should_exclude(path: &Path, patterns: &[String]) -> bool {
+    use glob::Pattern;
+
+    let path_str = path.to_string_lossy();
+
+    for pattern_str in patterns {
+        if let Ok(pattern) = Pattern::new(pattern_str) {
+            if pattern.matches(&path_str) {
+                return true;
+            }
+
+            // Also check against just the filename
+            if let Some(filename) = path.file_name() {
+                if pattern.matches(&filename.to_string_lossy()) {
+                    return true;
+                }
+            }
+        }
+    }
+
+    false
 }
 
 #[cfg(test)]
@@ -277,5 +304,71 @@ mod tests {
 
         // For large files, quick hash and full hash should be different
         assert_ne!(large_info.quick_hash, large_info.hash);
+    }
+
+    #[test]
+    fn test_exclusion_patterns() {
+        // Test basic filename pattern
+        assert!(should_exclude(
+            Path::new("/tmp/test.tmp"),
+            &["*.tmp".to_string()]
+        ));
+        assert!(!should_exclude(
+            Path::new("/tmp/test.txt"),
+            &["*.tmp".to_string()]
+        ));
+
+        // Test path pattern
+        assert!(should_exclude(
+            Path::new("/tmp/.git/config"),
+            &["*/.git/*".to_string()]
+        ));
+
+        // Test multiple patterns
+        assert!(should_exclude(
+            Path::new("/tmp/test.log"),
+            &["*.tmp".to_string(), "*.log".to_string()]
+        ));
+
+        // Test directory pattern
+        assert!(should_exclude(
+            Path::new("/tmp/node_modules/package.json"),
+            &["*/node_modules/*".to_string()]
+        ));
+    }
+
+    #[test]
+    fn test_scanner_with_exclusions() {
+        use std::io::Write;
+
+        let temp_dir = TempDir::new().unwrap();
+
+        // Create a subdirectory to avoid hidden directory issues
+        let test_dir = temp_dir.path().join("testdir");
+        fs::create_dir(&test_dir).unwrap();
+
+        // Create test files with content
+        let mut f1 = File::create(test_dir.join("include.txt")).unwrap();
+        f1.write_all(b"test content").unwrap();
+
+        let mut f2 = File::create(test_dir.join("exclude.tmp")).unwrap();
+        f2.write_all(b"excluded content").unwrap();
+
+        let mut f3 = File::create(test_dir.join("also_include.dat")).unwrap();
+        f3.write_all(b"more content").unwrap();
+
+        let config = ScanConfig {
+            root_path: test_dir,
+            min_size: 1,
+            max_size: None,
+            save_state: false,
+            exclude_patterns: vec!["*.tmp".to_string()],
+        };
+
+        let mut scanner = Scanner::new(config);
+        let _result = scanner.scan(|_, _| {}).unwrap();
+
+        // Should have scanned 2 files (excluded the .tmp file)
+        assert_eq!(scanner.scanned_count(), 2);
     }
 }
