@@ -15,6 +15,12 @@ pub struct ScanConfig {
     pub max_size: Option<u64>,
     pub save_state: bool,
     pub exclude_patterns: Vec<String>,
+    #[serde(default = "default_batch_size")]
+    pub batch_size: usize,
+}
+
+fn default_batch_size() -> usize {
+    1000
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
@@ -363,6 +369,7 @@ mod tests {
             max_size: None,
             save_state: false,
             exclude_patterns: vec!["*.tmp".to_string()],
+            batch_size: 1000,
         };
 
         let mut scanner = Scanner::new(config);

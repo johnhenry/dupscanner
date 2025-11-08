@@ -140,6 +140,7 @@ async fn start_new_scan(
         max_size: if max_size == 0 { None } else { Some(max_size) },
         save_state,
         exclude_patterns,
+        batch_size: 1000,
     };
 
     let mut app = app::App::new(config);
@@ -206,6 +207,7 @@ async fn yolo_scan(path: PathBuf, min_size: u64, max_size: u64, exclude_patterns
         max_size: if max_size == 0 { None } else { Some(max_size) },
         save_state: false,
         exclude_patterns,
+        batch_size: 1000,
     };
 
     let mut scanner = Scanner::new(config);
