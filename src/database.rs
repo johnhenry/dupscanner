@@ -70,6 +70,23 @@ impl ScanDatabase {
         Ok(())
     }
 
+    pub fn get_scan_info(&self, scan_id: i64) -> Option<ScanInfo> {
+        self.conn.query_row(
+            "SELECT id, root_path, start_time, end_time, files_scanned, groups_found FROM scans WHERE id = ?1",
+            params![scan_id],
+            |row| {
+                Ok(ScanInfo {
+                    id: row.get(0)?,
+                    root_path: PathBuf::from(row.get::<_, String>(1)?),
+                    start_time: row.get(2)?,
+                    end_time: row.get(3)?,
+                    files_scanned: row.get(4)?,
+                    groups_found: row.get(5)?,
+                })
+            }
+        ).ok()
+    }
+
     pub fn save_duplicate_group(&self, scan_id: i64, group: &DuplicateGroup) -> Result<()> {
         for file in &group.files {
             self.conn.execute(

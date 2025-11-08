@@ -67,6 +67,27 @@ enum Commands {
     /// List saved scan states
     List,
 
+    /// List scan history from database
+    History {
+        /// Number of scans to show
+        #[arg(short = 'n', long, default_value = "10")]
+        count: usize,
+
+        /// Database file (optional, uses default if not specified)
+        #[arg(long)]
+        db: Option<PathBuf>,
+    },
+
+    /// View a completed scan from database
+    View {
+        /// Scan ID to view
+        scan_id: i64,
+
+        /// Database file (optional, uses default if not specified)
+        #[arg(long)]
+        db: Option<PathBuf>,
+    },
+
     /// Generate demo test data with duplicates
     Demo {
         /// Directory to create test data in
@@ -124,6 +145,12 @@ async fn main() -> Result<()> {
         }
         Commands::List => {
             list_saved_states()?;
+        }
+        Commands::History { count, db } => {
+            show_scan_history(count, db).await?;
+        }
+        Commands::View { scan_id, db } => {
+            view_scan(scan_id, db).await?;
         }
         Commands::Demo { path, num_files, duplicates } => {
             demo::generate_demo_data(&path, num_files, duplicates)?;
@@ -215,6 +242,11 @@ async fn yolo_scan(path: PathBuf, min_size: u64, max_size: u64, exclude_patterns
 
     let start_time = Instant::now();
 
+    // Open database
+    let db_path = get_default_db_path()?;
+    let db = database::ScanDatabase::open(&db_path)?;
+    let scan_id = db.start_scan(&path)?;
+
     let config = ScanConfig {
         root_path: path,
         min_size,
@@ -231,6 +263,7 @@ async fn yolo_scan(path: PathBuf, min_size: u64, max_size: u64, exclude_patterns
     let mut total_scanned = 0;
     let mut total_deleted = 0;
     let mut total_space_freed: u64 = 0;
+    let mut groups_found = 0;
 
     println!("{}", "📊 Scanning files...".bold().cyan());
     println!();
@@ -290,6 +323,11 @@ async fn yolo_scan(path: PathBuf, min_size: u64, max_size: u64, exclude_patterns
                 continue;
             }
 
+            // Save duplicate group to database
+            let dup_group = duplicates::DuplicateGroup::new(hash.clone(), group_files.clone());
+            let _ = db.save_duplicate_group(scan_id, &dup_group);
+            groups_found += 1;
+
             // Determine which file to keep
             let keeper_index = SuggestionEngine::get_best_keeper(&group_files);
 
@@ -343,6 +381,9 @@ async fn yolo_scan(path: PathBuf, min_size: u64, max_size: u64, exclude_patterns
         }
     }
 
+    // Complete scan in database
+    let _ = db.complete_scan(scan_id, total_scanned, groups_found);
+
     // Print summary
     let total_elapsed = start_time.elapsed();
     println!("{}", "✅ YOLO mode complete!".bold().bright_green());
@@ -374,6 +415,127 @@ async fn yolo_scan(path: PathBuf, min_size: u64, max_size: u64, exclude_patterns
         println!();
         println!("{} {}", "💡".bright_yellow(), "Tip: All deleted files are in your system trash and can be restored from there.".dimmed());
     }
+
+    Ok(())
+}
+
+fn get_default_db_path() -> Result<PathBuf> {
+    let data_dir = dirs::data_local_dir()
+        .ok_or_else(|| anyhow::anyhow!("Could not determine local data directory"))?;
+    let app_dir = data_dir.join("dupscanner");
+    std::fs::create_dir_all(&app_dir)?;
+    Ok(app_dir.join("scans.db"))
+}
+
+async fn show_scan_history(count: usize, db_path: Option<PathBuf>) -> Result<()> {
+    use colored::Colorize;
+    use chrono::{DateTime, Utc};
+
+    let db_path = db_path.unwrap_or_else(|| get_default_db_path().unwrap());
+    let db = database::ScanDatabase::open(&db_path)?;
+    let scans = db.list_scans()?;
+
+    if scans.is_empty() {
+        println!("{}", "No scans found in database.".yellow());
+        println!("\n{} Run a scan with database support:", "💡".bright_yellow());
+        println!("   dupscanner scan /path/to/scan");
+        return Ok(());
+    }
+
+    println!("{}", "📊 Scan History".bold().cyan());
+    println!();
+
+    for (i, scan) in scans.iter().take(count).enumerate() {
+        let start_time = DateTime::from_timestamp(scan.start_time, 0)
+            .unwrap_or_else(|| Utc::now());
+
+        let status = if scan.end_time.is_some() {
+            "✓ Complete".green()
+        } else {
+            "⏳ In Progress".yellow()
+        };
+
+        println!("{:3}. {} {}",
+            (i + 1).to_string().bright_cyan(),
+            format!("ID {}", scan.id).bold(),
+            status
+        );
+        println!("     {}: {}", "Path".bold(), scan.root_path.display());
+        println!("     {}: {}", "Started".bold(), start_time.format("%Y-%m-%d %H:%M:%S"));
+
+        if scan.end_time.is_some() {
+            println!("     {}: {} files, {} duplicate groups",
+                "Results".bold(),
+                scan.files_scanned.to_string().bright_green(),
+                scan.groups_found.to_string().yellow()
+            );
+        }
+        println!();
+    }
+
+    println!("{} Use 'dupscanner view <id>' to review a scan", "💡".bright_yellow());
+
+    Ok(())
+}
+
+async fn view_scan(scan_id: i64, db_path: Option<PathBuf>) -> Result<()> {
+    use colored::Colorize;
+    use humansize::{format_size, BINARY};
+
+    let db_path = db_path.unwrap_or_else(|| get_default_db_path().unwrap());
+    let db = database::ScanDatabase::open(&db_path)?;
+
+    // Get scan info
+    let scan = db.get_scan_info(scan_id)
+        .ok_or_else(|| anyhow::anyhow!("Scan ID {} not found", scan_id))?;
+
+    // Get duplicate groups
+    let groups = db.load_duplicate_groups(scan_id)?;
+
+    println!("{}", format!("📊 Scan #{}", scan_id).bold().cyan());
+    println!();
+    println!("{}: {}", "Path".bold(), scan.root_path.display());
+    println!("{}: {}", "Files scanned".bold(), scan.files_scanned.to_string().bright_green());
+    println!("{}: {}", "Duplicate groups".bold(), scan.groups_found.to_string().yellow());
+    println!();
+
+    if groups.is_empty() {
+        println!("{}", "No duplicates found!".green());
+        return Ok(());
+    }
+
+    println!("{}", "🔍 Duplicate Groups:".bold().cyan());
+    println!();
+
+    for (i, group) in groups.iter().enumerate() {
+        let file_size = group.files.first().map(|f| f.size).unwrap_or(0);
+        let wasted_space = file_size * (group.files.len() as u64 - 1);
+
+        println!("{}. {} duplicates ({} wasted, hash: {}...)",
+            (i + 1).to_string().bright_cyan(),
+            group.files.len().to_string().yellow(),
+            format_size(wasted_space, BINARY).red(),
+            &group.hash[..8].dimmed()
+        );
+
+        for (j, file) in group.files.iter().enumerate() {
+            let marker = if j == 0 { "→" } else { " " };
+            println!("   {} {}", marker, file.path.display().to_string().dimmed());
+        }
+        println!();
+    }
+
+    let total_wasted: u64 = groups.iter()
+        .map(|g| {
+            let size = g.files.first().map(|f| f.size).unwrap_or(0);
+            size * (g.files.len() as u64 - 1)
+        })
+        .sum();
+
+    println!("{}: {}",
+        "Total wasted space".bold(),
+        format_size(total_wasted, BINARY).bright_red()
+    );
 
     Ok(())
 }
