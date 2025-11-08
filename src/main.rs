@@ -1,5 +1,6 @@
 mod app;
 mod backup;
+mod database;
 mod demo;
 mod duplicates;
 mod scanner;
