@@ -88,10 +88,6 @@ impl ExclusionMatcher {
         ExclusionMatcher { patterns: compiled }
     }
 
-    pub fn is_empty(&self) -> bool {
-        self.patterns.is_empty()
-    }
-
     pub fn matches(&self, path: &Path) -> bool {
         if self.patterns.is_empty() {
             return false;
@@ -151,13 +147,6 @@ impl FileInfo {
         Ok(())
     }
 
-    pub fn get_or_compute_hash(&mut self) -> Result<&str> {
-        if self.hash.is_none() {
-            self.compute_hash()?;
-        }
-        Ok(self.hash.as_deref().unwrap_or_default())
-    }
-
     pub fn compute_quick_hash(&mut self) -> Result<()> {
         let hash = compute_quick_hash(&self.path)?;
         if self.size <= QUICK_HASH_BYTES {
@@ -167,12 +156,6 @@ impl FileInfo {
         Ok(())
     }
 
-    pub fn get_or_compute_quick_hash(&mut self) -> Result<&str> {
-        if self.quick_hash.is_none() {
-            self.compute_quick_hash()?;
-        }
-        Ok(self.quick_hash.as_deref().unwrap_or_default())
-    }
 }
 
 pub struct Scanner {
@@ -182,10 +165,6 @@ pub struct Scanner {
 impl Scanner {
     pub fn new(config: ScanConfig) -> Self {
         Scanner { config }
-    }
-
-    pub fn config(&self) -> &ScanConfig {
-        &self.config
     }
 
     /// Walk the tree on a background thread, sending batches of `FileInfo`

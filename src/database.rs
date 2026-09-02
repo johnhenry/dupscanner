@@ -41,14 +41,11 @@ impl ScanDatabase {
         })
     }
 
+    #[cfg(test)]
     pub fn open_in_memory() -> Result<Self> {
         let conn = Connection::open_in_memory()?;
         Self::init_tables(&conn)?;
         Ok(ScanDatabase { conn, db_path: None })
-    }
-
-    pub fn is_in_memory(&self) -> bool {
-        self.db_path.is_none()
     }
 
     pub fn db_path(&self) -> Option<&Path> {

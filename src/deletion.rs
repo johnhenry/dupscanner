@@ -96,18 +96,8 @@ impl Deleter {
         Deleter { method, backup }
     }
 
-    /// Trash by default; falls back to the backup store if a backup manager
-    /// is provided and the trash is unavailable.
-    pub fn trash() -> Self {
-        Deleter { method: DeleteMethod::Trash, backup: None }
-    }
-
     pub fn method(&self) -> DeleteMethod {
         self.method
-    }
-
-    pub fn backup_manager(&self) -> Option<&BackupManager> {
-        self.backup.as_ref()
     }
 
     /// Remove one file according to the configured method. The file must
@@ -168,7 +158,6 @@ impl Deleter {
 pub struct PlannedDeletion {
     pub path: PathBuf,
     pub size: u64,
-    pub group_hash: String,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -177,10 +166,6 @@ pub struct DeletionPlan {
 }
 
 impl DeletionPlan {
-    pub fn is_empty(&self) -> bool {
-        self.items.is_empty()
-    }
-
     pub fn len(&self) -> usize {
         self.items.len()
     }
@@ -227,7 +212,6 @@ pub fn plan_deletions(groups: &[DuplicateGroup], wanted: &HashSet<PathBuf>) -> R
             plan.items.push(PlannedDeletion {
                 path: f.path.clone(),
                 size: f.size,
-                group_hash: group.hash.clone(),
             });
         }
     }

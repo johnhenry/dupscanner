@@ -187,17 +187,6 @@ impl SuggestionEngine {
         }
     }
 
-    /// Files suggested for deletion, highest score first.
-    pub fn suggest_deletions(files: &[FileInfo]) -> Vec<FileSuggestion> {
-        let analysis = Self::analyze(files);
-        let mut out: Vec<FileSuggestion> = analysis.suggested_deletions().cloned().collect();
-        out.sort_by(|a, b| b.score.cmp(&a.score).then_with(|| a.file_index.cmp(&b.file_index)));
-        out
-    }
-
-    pub fn get_best_keeper(files: &[FileInfo]) -> Option<usize> {
-        Self::analyze(files).keeper
-    }
 }
 
 fn components_lower(path: &Path) -> Vec<String> {

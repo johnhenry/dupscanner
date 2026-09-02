@@ -34,6 +34,7 @@ pub enum EngineEvent {
 pub struct RemovedPaths(Arc<Mutex<HashSet<PathBuf>>>);
 
 impl RemovedPaths {
+    #[cfg(test)]
     pub fn add(&self, path: PathBuf) {
         if let Ok(mut set) = self.0.lock() {
             set.insert(path);
@@ -85,10 +86,6 @@ impl ScanSession {
     /// Blocking wait for the next event; `None` once the engine is gone.
     pub fn next(&self) -> Option<EngineEvent> {
         self.events.recv().ok()
-    }
-
-    pub fn next_timeout(&self, timeout: Duration) -> Option<EngineEvent> {
-        self.events.recv_timeout(timeout).ok()
     }
 
     /// Run to completion, ignoring intermediate snapshots. Useful for

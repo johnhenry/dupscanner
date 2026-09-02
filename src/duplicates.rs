@@ -1,9 +1,10 @@
 use crate::scanner::FileInfo;
+#[cfg(test)]
 use anyhow::Result;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DuplicateGroup {
@@ -89,6 +90,7 @@ impl DuplicateFinder {
     }
 
     /// Process a single file. Prefer `process_batch` for throughput.
+    #[cfg(test)]
     pub fn process_file(&mut self, file: FileInfo) -> Result<()> {
         self.process_batch(vec![file]);
         Ok(())
@@ -206,10 +208,6 @@ impl DuplicateFinder {
         &self.groups
     }
 
-    pub fn groups_mut(&mut self) -> &mut Vec<DuplicateGroup> {
-        &mut self.groups
-    }
-
     /// Sort groups by wasted space (largest first) and refresh totals.
     /// Cheap to call repeatedly; does nothing when already sorted.
     pub fn ensure_sorted(&mut self) {
@@ -225,17 +223,14 @@ impl DuplicateFinder {
         self.recalculate_stats();
     }
 
+    #[cfg(test)]
     pub fn total_duplicates(&self) -> usize {
         self.total_duplicates
     }
 
+    #[cfg(test)]
     pub fn total_wasted_space(&self) -> u64 {
         self.total_wasted_space
-    }
-
-    /// Number of distinct files seen so far (all sizes).
-    pub fn files_seen(&self) -> usize {
-        self.size_groups.values().map(|v| v.len()).sum()
     }
 
     /// Forget files that were deleted or renamed away, in every structure.
@@ -257,23 +252,6 @@ impl DuplicateFinder {
         self.groups.retain(|g| !g.is_empty());
         self.rebuild_index();
         self.recalculate_stats();
-    }
-
-    /// Replace all groups (used when loading a finished scan from storage).
-    pub fn replace_groups(&mut self, groups: Vec<DuplicateGroup>) {
-        self.groups = groups.into_iter().filter(|g| !g.is_empty()).collect();
-        self.size_groups.clear();
-        for g in &self.groups {
-            for f in &g.files {
-                self.size_groups.entry(f.size).or_default().push(f.clone());
-            }
-        }
-        self.needs_sort = true;
-        self.ensure_sorted();
-    }
-
-    pub fn find_group_containing(&self, path: &Path) -> Option<&DuplicateGroup> {
-        self.groups.iter().find(|g| g.files.iter().any(|f| f.path == path))
     }
 
     fn rebuild_index(&mut self) {
@@ -298,6 +276,7 @@ impl Default for DuplicateFinder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
     use std::fs;
     use std::time::SystemTime;
     use tempfile::TempDir;
