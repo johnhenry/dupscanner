@@ -1,0 +1,123 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>dupscanner</title>
+    <link rel="stylesheet" href="/style.css" />
+  </head>
+  <body>
+    <header class="topbar">
+      <div class="topbar-inner">
+        <div class="brand">
+          <span class="logo" aria-hidden="true">dup</span>
+          <div class="brand-text">
+            <h1>dupscanner</h1>
+            <div class="root-line">
+              <span class="root-label">Scanning</span>
+              <code id="rootPath" class="root-path" title="">loading</code>
+            </div>
+          </div>
+        </div>
+        <div class="status-cluster">
+          <span id="statusBadge" class="badge badge-scanning">Connecting</span>
+          <div class="stat"><span id="statFiles" class="stat-value">0</span><span class="stat-label">files scanned</span></div>
+          <div class="stat"><span id="statGroups" class="stat-value">0</span><span class="stat-label">groups</span></div>
+          <div class="stat"><span id="statDupes" class="stat-value">0</span><span class="stat-label">duplicates</span></div>
+          <div class="stat"><span id="statWasted" class="stat-value stat-wasted">0 B</span><span class="stat-label">reclaimable</span></div>
+          <div class="stat"><span id="statElapsed" class="stat-value">0s</span><span class="stat-label">elapsed</span></div>
+          <button id="themeToggle" class="icon-btn" type="button" aria-label="Toggle dark mode" title="Toggle dark mode">Dark</button>
+        </div>
+      </div>
+      <div id="scanBar" class="scan-bar" hidden>
+        <span class="spinner" aria-hidden="true"></span>
+        <span id="scanBarText">Scanning...</span>
+      </div>
+    </header>
+
+    <main class="main">
+      <section class="toolbar" aria-label="Filters and actions">
+        <div class="filter">
+          <label for="pathFilter">Path contains</label>
+          <input id="pathFilter" type="search" placeholder="Filter by path" autocomplete="off" />
+        </div>
+        <div class="filter">
+          <label for="sizeFilter">Size</label>
+          <select id="sizeFilter">
+            <option value="all">All sizes</option>
+            <option value="tiny">Tiny (under 10 KiB)</option>
+            <option value="small">Small (10 KiB to 1 MiB)</option>
+            <option value="medium">Medium (1 MiB to 100 MiB)</option>
+            <option value="large">Large (100 MiB and up)</option>
+          </select>
+        </div>
+        <div class="filter">
+          <label for="typeFilter">Type</label>
+          <select id="typeFilter">
+            <option value="all">All types</option>
+            <option value="image">Images</option>
+            <option value="video">Video</option>
+            <option value="audio">Audio</option>
+            <option value="document">Documents</option>
+            <option value="archive">Archives</option>
+            <option value="code">Code</option>
+            <option value="other">Other</option>
+          </select>
+        </div>
+        <div class="filter">
+          <label for="pageSize">Per page</label>
+          <select id="pageSize">
+            <option value="10">10</option>
+            <option value="25">25</option>
+            <option value="50">50</option>
+            <option value="100">100</option>
+            <option value="250">250</option>
+          </select>
+        </div>
+        <div class="filter">
+          <label for="autoSelect">Auto-select (this page)</label>
+          <select id="autoSelect">
+            <option value="">Choose an action</option>
+            <option value="suggested">Mark suggested copies</option>
+            <option value="allButKeeper">Mark all but keeper</option>
+            <option value="allButOldest">Mark all but oldest</option>
+            <option value="allButNewest">Mark all but newest</option>
+            <option value="allButShortest">Mark all but shortest path</option>
+            <option value="allButLongest">Mark all but longest path</option>
+            <option value="clear">Clear marks</option>
+          </select>
+        </div>
+        <div class="toolbar-actions">
+          <button id="expandAll" type="button" class="btn">Expand all</button>
+          <button id="collapseAll" type="button" class="btn">Collapse all</button>
+          <button id="batchRename" type="button" class="btn" disabled>Batch rename</button>
+          <button id="deleteSelected" type="button" class="btn btn-danger" disabled>Delete marked</button>
+        </div>
+      </section>
+
+      <div id="summary" class="summary" aria-live="polite"></div>
+      <div id="groups" class="groups"></div>
+      <nav id="pagination" class="pagination" aria-label="Pages"></nav>
+    </main>
+
+    <footer class="footer">
+      <span id="footerMethod" class="footer-note"></span>
+      <button id="shutdown" type="button" class="btn btn-ghost">Stop server</button>
+    </footer>
+
+    <div id="toasts" class="toasts" aria-live="polite"></div>
+
+    <div id="modalBackdrop" class="modal-backdrop" hidden>
+      <div id="modal" class="modal" role="dialog" aria-modal="true" aria-labelledby="modalTitle">
+        <div class="modal-head">
+          <h2 id="modalTitle">Title</h2>
+          <button id="modalClose" type="button" class="icon-btn" aria-label="Close">Close</button>
+        </div>
+        <div id="modalBody" class="modal-body"></div>
+        <div id="modalFoot" class="modal-foot"></div>
+      </div>
+    </div>
+
+    <script src="/app.js"></script>
+  </body>
+</html>
