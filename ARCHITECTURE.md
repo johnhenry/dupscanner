@@ -1,497 +1,54 @@
-# DupScanner Architecture
+# Architecture
 
-This document provides detailed information about the internal architecture of DupScanner.
-
-## Overview
-
-DupScanner is built using a modular architecture with clear separation of concerns:
+dupscanner is one binary with one engine and three front ends (terminal UI, web UI, non-interactive CLI modes). Every front end consumes the same event stream and goes through the same deletion layer.
 
 ```
-┌─────────────────────────────────────────────────────────┐
-│                         CLI                              │
-│                      (main.rs)                          │
-└────────────────────┬────────────────────────────────────┘
-                     │
-                     ▼
-┌─────────────────────────────────────────────────────────┐
-│                    Application                          │
-│                     (app.rs)                            │
-│  ┌──────────┬──────────┬──────────┬──────────────────┐ │
-│  │ Scanner  │  Finder  │  Backup  │  State Manager   │ │
-│  └──────────┴──────────┴──────────┴──────────────────┘ │
-└────────────────────┬────────────────────────────────────┘
-                     │
-                     ▼
-┌─────────────────────────────────────────────────────────┐
-│                         TUI                              │
-│                     (tui.rs)                            │
-│                   [ratatui + crossterm]                 │
-└─────────────────────────────────────────────────────────┘
+scanner.rs ──walker thread──▶ engine.rs ──hasher thread──▶ EngineEvent ──▶ app.rs + tui.rs
+                                 │                                     ├─▶ web.rs (+ assets/)
+                                 └─ duplicates.rs                      └─▶ main.rs (--json, --yolo)
+                                                                              │
+deletion.rs ◀──── every removal ─────────────────────────────────────────────┘
+   ├─ trash crate
+   └─ backup.rs
+database.rs  ◀── completed scans, later edits
+suggestions.rs ── scoring used by all front ends and report.rs
 ```
 
-## Module Details
-
-### 1. Main (`main.rs`)
-
-**Responsibility**: CLI interface and command routing
-
-**Key Features**:
-- Command-line argument parsing with `clap`
-- Subcommand routing (scan, resume, list)
-- Application initialization
-- Error handling at top level
-
-**Data Flow**:
-```
-User Input → CLI Parser → Command Handler → App Creation → TUI Launch
-```
-
-### 2. Scanner (`scanner.rs`)
-
-**Responsibility**: File discovery and hashing
-
-**Key Structures**:
-```rust
-pub struct Scanner {
-    config: ScanConfig,
-    size_groups: HashMap<u64, Vec<FileInfo>>,
-    scanned_count: usize,
-    total_size: u64,
-}
-
-pub struct FileInfo {
-    path: PathBuf,
-    size: u64,
-    hash: Option<String>,
-    modified: SystemTime,
-    depth: usize,
-}
-```
-
-**Algorithm**:
-1. Walk directory tree (using `walkdir`)
-2. Filter files by size constraints
-3. Group files by size (HashMap<u64, Vec<FileInfo>>)
-4. Compute SHA-256 hash lazily (only when needed)
-
-**Performance Optimizations**:
-- Size-based pre-filtering avoids hashing unique files
-- Streaming hash computation (8KB buffer)
-- Lazy evaluation - hashes computed only for size matches
-- Progress callbacks for UI responsiveness
-
-### 3. Duplicate Finder (`duplicates.rs`)
-
-**Responsibility**: Identify actual duplicates using hashes
-
-**Key Structures**:
-```rust
-pub struct DuplicateFinder {
-    groups: Vec<DuplicateGroup>,
-    total_duplicates: usize,
-    total_wasted_space: u64,
-}
-
-pub struct DuplicateGroup {
-    hash: String,
-    files: Vec<FileInfo>,
-    total_size: u64,
-    wasted_space: u64,
-}
-```
-
-**Algorithm**:
-```
-1. Receive size_groups from Scanner
-2. For each group with len > 1:
-   a. Compute hash for each file
-   b. Group by hash
-   c. Keep only groups with len > 1
-3. Sort groups by wasted_space (descending)
-4. Calculate statistics
-```
-
-**Wasted Space Calculation**:
-```rust
-wasted_space = file_size × (duplicate_count - 1)
-```
-
-### 4. Suggestion Engine (`suggestions.rs`)
-
-**Responsibility**: Intelligently suggest which files to delete
-
-**Scoring System**:
-```rust
-Temporary directory:  100 points
-"copy" in filename:    80 points
-Downloads directory:   60 points
-Deeper path:           40 points
-Longer filename:       30 points
-Newer file:            20 points
-```
-
-**Decision Algorithm**:
-```
-1. Score each file based on criteria
-2. Identify files NOT suggested for deletion
-3. Among non-suggested files, prefer oldest
-4. If all files suggested, keep one with lowest score
-```
-
-**Example**:
-```
-File A: /home/user/document.pdf         (score: 0)
-File B: /tmp/document.pdf               (score: 100)
-File C: /home/user/Downloads/document.pdf (score: 60)
-
-Suggestion: Keep A, delete B and C
-```
-
-### 5. Backup Manager (`backup.rs`)
-
-**Responsibility**: Safe file deletion with backup
-
-**Key Structures**:
-```rust
-pub struct BackupManager {
-    backup_dir: PathBuf,
-    records: Vec<BackupRecord>,
-}
-
-pub struct BackupRecord {
-    original_path: PathBuf,
-    backup_path: PathBuf,
-    size: u64,
-    timestamp: DateTime<Utc>,
-}
-```
-
-**Backup Process**:
-```
-1. Validate file exists
-2. Create timestamped backup filename
-3. Copy file to backup directory
-4. Record backup in JSON database
-5. Delete original file
-6. Update statistics
-```
-
-**Backup Location**:
-- Linux/macOS: `~/.local/share/dupscanner/backups/`
-- Windows: `%APPDATA%\dupscanner\backups\`
-
-### 6. State Persistence (`state.rs`)
-
-**Responsibility**: Save/restore scan state
-
-**Key Structures**:
-```rust
-pub struct ScanState {
-    config: ScanConfig,
-    size_groups: HashMap<u64, Vec<FileInfo>>,
-    duplicate_groups: Vec<DuplicateGroup>,
-    scanned_count: usize,
-    total_size: u64,
-    timestamp: DateTime<Utc>,
-    completed: bool,
-}
-```
-
-**State File Format** (JSON):
-```json
-{
-  "config": {
-    "root_path": "/path/to/scan",
-    "min_size": 1024,
-    "max_size": null,
-    "save_state": true
-  },
-  "scanned_count": 12345,
-  "duplicate_groups": [...],
-  "timestamp": "2025-01-15T10:30:00Z",
-  "completed": true
-}
-```
-
-**State Management**:
-- Auto-save on quit (if --save-state enabled)
-- Manual save with 's' key
-- Resume from last state
-- State file per scan directory (using path hash)
-
-### 7. Application (`app.rs`)
-
-**Responsibility**: Central application state and coordination
-
-**State Machine**:
-```
-Scanning → FindingDuplicates → ReviewingDuplicates → Completed
-    ↓              ↓                    ↓
-  (can pause)  (automated)      (user interaction)
-```
-
-**Key Methods**:
-- `new()` - Create fresh scan
-- `from_state_file()` - Resume from saved state
-- `save_state()` - Persist current state
-- `delete_marked_files()` - Execute deletions with backup
-- `next_group()` / `previous_group()` - Navigate duplicates
-- `mark_all_suggested()` - Auto-mark based on suggestions
-
-### 8. TUI (`tui.rs`)
-
-**Responsibility**: Interactive terminal interface
-
-**Layout**:
-```
-┌────────────────────────────────────────────┐
-│              Header                        │
-├──────────────────┬─────────────────────────┤
-│                  │                         │
-│   Group List     │    File List            │
-│   (30%)          │    (70%)                │
-│                  │                         │
-│  Group 1 ───►    │  [ ] /path/file1.txt   │
-│  Group 2         │  [X] /tmp/file2.txt    │
-│  Group 3         │  [ ] /path/file3.txt   │
-│                  │                         │
-├──────────────────┴─────────────────────────┤
-│              Footer / Status               │
-└────────────────────────────────────────────┘
-```
-
-**Event Loop**:
-```
-1. Draw UI frame
-2. Poll for input (100ms timeout)
-3. Handle keyboard events
-4. Update application state
-5. Repeat
-```
-
-**Key Bindings**:
-- Navigation: j/k (vim) or arrows
-- Group switching: n/p or left/right
-- Marking: space, a (auto), o (keep oldest)
-- Actions: d (delete), s (save), q (quit)
-- Help: ?
-
-## Data Flow
-
-### Complete Scan Flow
-
-```
-1. User runs: dupscanner scan /path
-
-2. CLI parses arguments → ScanConfig
-
-3. App initializes:
-   - Create Scanner with config
-   - Create DuplicateFinder
-   - Create BackupManager
-   - Load BackupManager records
-
-4. TUI launches:
-   - Enable raw mode
-   - Enter alternate screen
-   - Start event loop
-
-5. Scanning Phase:
-   - Scanner walks directory
-   - Groups files by size
-   - Updates UI with progress
-   - User can pause/resume
-
-6. Finding Duplicates Phase:
-   - For each size group with >1 files:
-     - Compute hashes
-     - Group by hash
-     - Create DuplicateGroup
-   - Sort by wasted space
-
-7. Review Phase:
-   - Display groups in TUI
-   - Show suggestions with scores
-   - User marks files for deletion
-   - User confirms deletion
-
-8. Deletion:
-   - For each marked file:
-     - Create backup
-     - Delete original
-     - Update records
-   - Remove empty groups
-   - Save state
-
-9. Cleanup:
-   - Save final state
-   - Restore terminal
-   - Exit
-```
-
-## Design Patterns
-
-### 1. Builder Pattern
-Used for `ScanConfig` construction from CLI args
-
-### 2. State Pattern
-`AppState` enum manages application lifecycle
-
-### 3. Repository Pattern
-`BackupManager` and `StateManager` abstract persistence
-
-### 4. Observer Pattern
-Scanner uses callbacks for progress updates
-
-### 5. Strategy Pattern
-`SuggestionEngine` uses pluggable scoring criteria
-
-## Error Handling
-
-**Error Types**:
-- `anyhow::Error` for general errors
-- `io::Error` for file operations
-- `serde_json::Error` for serialization
-
-**Error Propagation**:
-```rust
-fn operation() -> Result<()> {
-    file_operation().context("Failed during file op")?;
-    Ok(())
-}
-```
-
-**User-Facing Errors**:
-- Displayed in TUI status bar
-- Logged but don't crash application
-- Allow recovery when possible
-
-## Testing Strategy
-
-### Unit Tests
-Each module has tests for:
-- Core functionality
-- Edge cases
-- Error conditions
-
-### Integration Tests
-- End-to-end scan scenarios
-- State persistence/restore
-- Backup/restore operations
-
-### Manual Testing
-- TUI interaction
-- Large directory scans
-- Resume functionality
-
-## Performance Considerations
-
-### Memory Usage
-- File metadata: ~200 bytes per file
-- 100k files ≈ 20MB memory
-- HashMap overhead included
-
-### CPU Usage
-- SHA-256: ~400 MB/s (single core)
-- I/O bound for large files
-- Can parallelize with rayon
-
-### Disk I/O
-- Sequential reads for hashing
-- Minimal writes (state saves)
-- Backup is copy operation
-
-### Optimization Opportunities
-1. **Parallel hashing**: Use rayon for multi-core
-2. **Incremental scanning**: Track filesystem changes
-3. **Content-based chunking**: Deduplicate file parts
-4. **Bloom filters**: Quick duplicate checks
-5. **Memory-mapped I/O**: Faster hashing for large files
-
-## Security Considerations
-
-### Safety Measures
-- No automatic deletion without user confirmation
-- All deletions create backups
-- Symlinks not followed (prevents loops)
-- Permission checks before operations
-
-### Potential Issues
-- Backup directory can grow large
-- State files contain full paths
-- No encryption of backups
-- No privilege escalation protection
-
-## Future Enhancements
-
-### Planned Features
-1. Parallel processing with rayon
-2. Content-aware detection (perceptual hashing)
-3. Network/cloud storage support
-4. Plugin system for custom rules
-5. Export reports (JSON, CSV, HTML)
-
-### Architecture Changes
-1. Move to async I/O (tokio)
-2. Add database backend (SQLite)
-3. Separate CLI and TUI into different binaries
-4. Add REST API for remote control
-5. Implement plugin system with dynamic loading
-
-## Dependencies
-
-### Core
-- `clap` - CLI parsing
-- `ratatui` - TUI framework
-- `crossterm` - Terminal control
-- `serde` + `serde_json` - Serialization
-
-### Utilities
-- `walkdir` - Directory traversal
-- `sha2` - Hashing
-- `chrono` - Timestamps
-- `dirs` - User directories
-- `anyhow` - Error handling
-
-### Development
-- `tempfile` - Testing
-- `criterion` - Benchmarking (future)
-
-## Building and Development
-
-### Build Profiles
-
-**Debug** (fast compile, slow runtime):
-```bash
-cargo build
-```
-
-**Release** (slow compile, fast runtime):
-```bash
-cargo build --release
-```
-
-### Code Organization
-
-**Style Guide**:
-- Rust standard formatting (`rustfmt`)
-- Clippy lints enabled
-- Documentation for public APIs
-- Tests in same file as implementation
-
-**Module Privacy**:
-- Public types exported at crate root
-- Internal types kept private
-- Clear API boundaries
-
-## Contribution Guidelines
-
-See CONTRIBUTING.md for:
-- Code style requirements
-- Testing expectations
-- PR process
-- Architecture decision records
-
-## License
-
-MIT License - See LICENSE file
+## Modules
+
+| Module | Responsibility |
+|---|---|
+| `scanner.rs` | `ScanConfig`, `FileInfo`, exclusion matching (`ExclusionMatcher`, compiled once, applied with `WalkDir::filter_entry` so excluded directories are never descended), the walker thread, and the two hash functions. Batches of `FileInfo` go out over a bounded `sync_channel(4)`. |
+| `duplicates.rs` | `DuplicateFinder::process_batch`: register files by size; for sizes with more than one file, quick-hash (first 64 KiB) every unhashed member in parallel; for shared quick hashes, full-hash in parallel; rebuild the affected groups from the whole size bucket. `DuplicateGroup` keeps files sorted by path so output is deterministic. |
+| `engine.rs` | `ScanSession` spawns the walker and a hasher thread that owns the `DuplicateFinder`. It emits `EngineEvent::Progress`, throttled `EngineEvent::Groups` snapshots (at most every 250 ms) and a final `EngineEvent::Complete { finder, progress, elapsed }`. `RemovedPaths` lets a front end report files it deleted mid-scan so the final result excludes them. |
+| `suggestions.rs` | `SuggestionEngine::analyze` scores each file in a group and picks the keeper. Pure function of the `FileInfo`s; used by the TUI, web UI, yolo mode and JSON report. |
+| `deletion.rs` | `plan_deletions` validates a set of paths against the current groups (must belong to a group; a group may never lose every member). `Deleter` performs removals via trash, the backup store, or permanently, re-checking file size first. `DeletionReport` carries per-file outcomes. |
+| `backup.rs` | Backup store with collision-free filenames (timestamp + short digest), an atomically written `records.json` index, restore and clean-up. |
+| `database.rs` | SQLite (WAL) with `scans` and `files` tables. Groups are written in one transaction; `modified` and `depth` are stored so reopened scans still get sensible suggestions. Old databases are migrated in place. |
+| `paths.rs` | The data directory and default database path. |
+| `report.rs` | Serializable `ScanReport` / `GroupReport` used by `scan --json`, `view --json` and the web API, including keeper flags and reasons. |
+| `app.rs` | Front-end-agnostic review state: current groups, selection, marks keyed by path, pending confirmation, deletion through `Deleter`, persistence to the database. |
+| `tui.rs` | ratatui rendering and key handling. Installs a panic hook that restores the terminal. All truncation is on character boundaries. |
+| `web.rs` + `assets/` | axum server bound to 127.0.0.1 with embedded static assets, SSE progress, and JSON endpoints that mirror `report.rs`. Every file-touching endpoint canonicalizes the path, checks it is inside the scan root and belongs to a current group. |
+| `main.rs` | clap CLI. `scan` (TUI, `--json`, `--yolo`), `serve`, `history`, `view`, `forget`, `restore`, `demo`. |
+| `demo.rs` | Generates a directory tree with known duplicates for trying the tool. |
+
+## Data flow for a scan
+
+1. `main.rs` builds a `ScanConfig` (canonical root, size limits, exclusion patterns) and a `Deleter`.
+2. `ScanSession::start` spawns the walker (in `scanner.rs`) and the hasher thread (in `engine.rs`).
+3. The walker sends batches of stat-only `FileInfo`s. The hasher calls `DuplicateFinder::process_batch`, which hashes only what the size and quick-hash tiers require, using rayon.
+4. Every 250 ms the hasher publishes a sorted snapshot of groups. Front ends render it immediately; the TUI and web UI allow marking and deleting while the scan is still running.
+5. On completion the hasher hands over the `DuplicateFinder`. The front end records the scan in the database.
+6. Deletions: front end collects marked paths, `plan_deletions` validates, the user confirms, `Deleter` removes, the groups are updated in memory and in the database. If the scan is still running, the removed paths are also pushed to the engine through `RemovedPaths`.
+
+## Invariants
+
+- A `DuplicateGroup` always has at least two files once exposed to a front end; empties are dropped on every mutation.
+- Files are hashed at most once per tier per scan.
+- No code path deletes a file that is not a member of a current group, and no group loses its last member through dupscanner.
+- The web server never binds to a non-loopback address, and never renders HTML, SVG or scripts from the scanned tree inline.
+
+## Testing
+
+`cargo test` covers hashing tiers, exclusion matching and pruning, grouping (including the two-file case and cross-batch arrival), engine completion and mid-scan removals, deletion planning rules, backup collisions and restore, database round trips, suggestion scoring, path truncation, size parsing, and web path validation.
