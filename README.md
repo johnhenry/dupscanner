@@ -44,7 +44,7 @@ Every file in a group gets a score. Positive signals make it a better candidate 
 | Signal | Weight | Example |
 |---|---|---|
 | Inside a temp or cache directory | +100 | `/tmp/report.pdf` |
-| Filename looks like a copy | +80 | `report copy.pdf`, `report (1).pdf`, `report 2.pdf`, `report_backup.pdf` |
+| Filename looks like a copy | +80 | `report copy.pdf`, `report (1).pdf`, `report_backup.pdf`; `report 2.pdf` only when `report.pdf` is in the same group |
 | Inside Downloads | +60 | `~/Downloads/report.pdf` |
 | Inside a backup, old or archive folder | +50 | `~/backup/2019/report.pdf` |
 | Deepest path in the group | +20 | |

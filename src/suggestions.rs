@@ -8,6 +8,7 @@
 
 use crate::scanner::FileInfo;
 use serde::Serialize;
+use std::collections::HashSet;
 use std::path::Path;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -133,6 +134,7 @@ impl SuggestionEngine {
             .collect();
         let min_len = name_lens.iter().copied().min().unwrap_or(0);
         let max_len = name_lens.iter().copied().max().unwrap_or(0);
+        let group_stems: HashSet<String> = files.iter().filter_map(|f| stem_lower(&f.path)).collect();
 
         let mut analysed = Vec::with_capacity(files.len());
         for (i, file) in files.iter().enumerate() {
@@ -141,7 +143,7 @@ impl SuggestionEngine {
             if is_in_temp_directory(&file.path) {
                 reasons.push(SuggestionReason::InTempDirectory);
             }
-            if filename_looks_like_copy(&file.path) {
+            if filename_looks_like_copy(&file.path, &group_stems) {
                 reasons.push(SuggestionReason::HasCopyInName);
             }
             if is_in_downloads_directory(&file.path) {
@@ -245,16 +247,26 @@ fn is_in_preferred_location(path: &Path) -> bool {
     })
 }
 
+/// Lower-cased file stem (name without its last extension).
+fn stem_lower(path: &Path) -> Option<String> {
+    let name = path.file_name()?.to_string_lossy().to_lowercase();
+    Some(match name.rfind('.') {
+        Some(pos) if pos > 0 => name[..pos].to_string(),
+        _ => name,
+    })
+}
+
 /// Only the file name is inspected. Directory names are covered by the
 /// backup-directory rule so a folder called "Copy Editing" does not taint
 /// every file under it.
-fn filename_looks_like_copy(path: &Path) -> bool {
-    let Some(name) = path.file_name() else { return false };
-    let name = name.to_string_lossy().to_lowercase();
-    let stem = match name.rfind('.') {
-        Some(pos) if pos > 0 => &name[..pos],
-        _ => name.as_str(),
-    };
+///
+/// Unambiguous markers ("copy", "duplicate", "backup", "(1)") always count.
+/// A trailing number such as "report 2" or "report_2" only counts when the
+/// base name ("report") is also in the group, so sequential names like
+/// "chapter_2" are not mistaken for copies.
+fn filename_looks_like_copy(path: &Path, group_stems: &HashSet<String>) -> bool {
+    let Some(stem) = stem_lower(path) else { return false };
+    let stem = stem.as_str();
 
     if stem.starts_with("copy of ") || stem.starts_with("kopie von ") {
         return true;
@@ -262,18 +274,20 @@ fn filename_looks_like_copy(path: &Path) -> bool {
     if stem.contains("copy") || stem.contains("duplicate") || stem.contains("backup") {
         return true;
     }
-    // "report (1)", "report(2)", "report 2", "report-2", "report_2"
-    if let Some(open) = stem.rfind('(') {
-        let inner = stem[open + 1..].trim_end_matches(')');
-        if !inner.is_empty() && inner.chars().all(|c| c.is_ascii_digit()) && stem.ends_with(')') {
-            return true;
+    // "report (1)", "report(2)"
+    if stem.ends_with(')') {
+        if let Some(open) = stem.rfind('(') {
+            let inner = &stem[open + 1..stem.len() - 1];
+            if !inner.is_empty() && inner.chars().all(|c| c.is_ascii_digit()) {
+                return true;
+            }
         }
     }
-    // "photo 2", "photo-3", "photo_4": a single digit 2-9 after a separator.
-    // Not "chapter 12", "img_2024", or "part 1".
-    let mut chars = stem.chars().rev();
-    if let (Some(last), Some(sep)) = (chars.next(), chars.next()) {
-        if ('2'..='9').contains(&last) && matches!(sep, ' ' | '-' | '_') {
+    // "report 2", "report-2", "report_2" when "report" is also present.
+    let digits = stem.trim_end_matches(|c: char| c.is_ascii_digit());
+    if digits.len() < stem.len() && stem.len() - digits.len() <= 3 {
+        let base = digits.trim_end_matches([' ', '-', '_']);
+        if base.len() < digits.len() && !base.is_empty() && group_stems.contains(base) {
             return true;
         }
     }
@@ -308,24 +322,25 @@ mod tests {
 
     #[test]
     fn copy_patterns_in_filename() {
+        let with_base: HashSet<String> = ["report".to_string()].into();
+        let empty: HashSet<String> = HashSet::new();
         for name in [
             "report copy.pdf",
             "report (1).pdf",
             "report(2).pdf",
-            "report 2.pdf",
-            "report-2.pdf",
             "Copy of report.pdf",
             "report_backup.pdf",
             "report_duplicate.pdf",
         ] {
-            assert!(filename_looks_like_copy(Path::new(name)), "{name}");
+            assert!(filename_looks_like_copy(Path::new(name), &empty), "{name}");
         }
-        for name in ["report.pdf", "img_2024.jpg", "chapter 12.md", "copyright.txt"] {
-            // "copyright" contains "copy": accepted as a known false positive
-            // only if it is not the sole copy, so check the others strictly.
-            if name != "copyright.txt" {
-                assert!(!filename_looks_like_copy(Path::new(name)), "{name}");
-            }
+        // Trailing numbers only count next to their base name.
+        for name in ["report 2.pdf", "report-2.pdf", "report_2.pdf", "report 12.pdf"] {
+            assert!(filename_looks_like_copy(Path::new(name), &with_base), "{name}");
+            assert!(!filename_looks_like_copy(Path::new(name), &empty), "{name}");
+        }
+        for name in ["report.pdf", "img_2024.jpg", "chapter 12.md", "file_2.txt"] {
+            assert!(!filename_looks_like_copy(Path::new(name), &with_base), "{name}");
         }
     }
 
