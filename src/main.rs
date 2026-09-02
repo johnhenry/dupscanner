@@ -25,7 +25,7 @@ enum Commands {
     /// Scan directories for duplicate files
     Scan {
         /// Directory to scan
-        #[arg(value_name = "PATH")]
+        #[arg(value_name = "PATH", default_value = ".")]
         path: PathBuf,
 
         /// Minimum file size to scan (in bytes)
@@ -51,6 +51,10 @@ enum Commands {
         /// Exclude patterns (glob format, can be specified multiple times)
         #[arg(short = 'e', long = "exclude", value_name = "PATTERN")]
         exclude: Vec<String>,
+
+        /// Disable default exclusions (like .git/, node_modules/, etc.)
+        #[arg(long)]
+        no_default_excludes: bool,
 
         /// Use backup instead of trash (backup creates copies, trash moves to system recycle bin)
         #[arg(long)]
@@ -117,11 +121,21 @@ async fn main() -> Result<()> {
             resume,
             yolo,
             exclude,
+            no_default_excludes,
             use_backup,
         } => {
+            // Merge default exclusions with user-provided ones
+            let exclude_patterns = if no_default_excludes {
+                exclude
+            } else {
+                let mut patterns = scanner::get_default_exclusions();
+                patterns.extend(exclude);
+                patterns
+            };
+
             if yolo {
                 // YOLO mode: non-interactive real-time duplicate removal
-                yolo_scan(path, min_size, max_size, exclude, use_backup).await?;
+                yolo_scan(path, min_size, max_size, exclude_patterns, use_backup).await?;
             } else if resume {
                 // Try to resume from default state file
                 let state_file = state::get_default_state_file(&path)?;
@@ -129,10 +143,10 @@ async fn main() -> Result<()> {
                     resume_scan(state_file).await?;
                 } else {
                     eprintln!("No previous scan state found for this directory");
-                    start_new_scan(path, min_size, max_size, save_state, exclude).await?;
+                    start_new_scan(path, min_size, max_size, save_state, exclude_patterns).await?;
                 }
             } else {
-                start_new_scan(path, min_size, max_size, save_state, exclude).await?;
+                start_new_scan(path, min_size, max_size, save_state, exclude_patterns).await?;
             }
         }
         Commands::Resume { state_file } => {
@@ -216,7 +230,6 @@ async fn yolo_scan(path: PathBuf, min_size: u64, max_size: u64, exclude_patterns
     use colored::Colorize;
     use humansize::{format_size, BINARY};
     use scanner::{Scanner, ScanConfig};
-    use std::collections::HashMap;
     use std::time::Instant;
     use suggestions::SuggestionEngine;
 
@@ -228,7 +241,18 @@ async fn yolo_scan(path: PathBuf, min_size: u64, max_size: u64, exclude_patterns
         println!("   {}: {}", "Max size".bold(), format_size(max_size, BINARY));
     }
     if !exclude_patterns.is_empty() {
-        println!("   {}: {}", "Excluding".bold().yellow(), exclude_patterns.join(", ").dimmed());
+        let default_count = scanner::get_default_exclusions().len();
+        let user_count = exclude_patterns.len().saturating_sub(default_count);
+        if user_count > 0 {
+            println!("   {}: {} default + {} custom patterns",
+                "Exclusions".bold().yellow(),
+                default_count,
+                user_count);
+        } else {
+            println!("   {}: {} default patterns",
+                "Exclusions".bold().yellow(),
+                default_count);
+        }
     }
     println!("   {}: {}",
         "Deletion method".bold(),
@@ -256,34 +280,116 @@ async fn yolo_scan(path: PathBuf, min_size: u64, max_size: u64, exclude_patterns
         batch_size: 1000,
     };
 
-    let mut scanner = Scanner::new(config);
+    let scanner = Scanner::new(config);
     let mut backup_manager = BackupManager::new()?;
     backup_manager.load_records()?;
+    let mut finder = duplicates::DuplicateFinder::new();
 
     let mut total_scanned = 0;
     let mut total_deleted = 0;
     let mut total_space_freed: u64 = 0;
-    let mut groups_found = 0;
+    let mut processed_groups = std::collections::HashSet::new();
 
-    println!("{}", "📊 Scanning files...".bold().cyan());
+    println!("{}", "📊 Scanning files and removing duplicates...".bold().cyan());
     println!();
 
     let scan_start = Instant::now();
 
-    // Scan and process duplicates in real-time
-    let size_groups_result = scanner.scan(|count, _path| {
-        total_scanned = count;
-        if count % 100 == 0 {
-            let elapsed = scan_start.elapsed().as_secs_f64();
-            let rate = if elapsed > 0.0 { count as f64 / elapsed } else { 0.0 };
-            print!("\r   {} {} files ({:.1} files/sec)",
-                "Scanned:".bold(),
-                count.to_string().bright_green(),
-                rate);
-            use std::io::Write;
-            std::io::stdout().flush().unwrap();
+    // Start streaming scan
+    let (file_rx, progress_rx) = scanner.scan_streaming();
+
+    // Process files as they arrive
+    loop {
+        // Check for progress updates
+        while let Ok(progress) = progress_rx.try_recv() {
+            total_scanned = progress.scanned_count;
+            if total_scanned % 100 == 0 {
+                let elapsed = scan_start.elapsed().as_secs_f64();
+                let rate = if elapsed > 0.0 { total_scanned as f64 / elapsed } else { 0.0 };
+                print!("\r   {} {} files ({:.1} files/sec, {} groups)",
+                    "Scanned:".bold(),
+                    total_scanned.to_string().bright_green(),
+                    rate,
+                    finder.groups().len().to_string().yellow());
+                use std::io::Write;
+                std::io::stdout().flush().unwrap();
+            }
         }
-    })?;
+
+        // Process incoming batches
+        match file_rx.try_recv() {
+            Ok(batch) => {
+                // Process all files in this batch
+                for file in batch {
+                    let _ = finder.process_file(file);
+                }
+
+                // Periodically sort groups (every 100 files)
+                if total_scanned % 100 == 0 {
+                    finder.ensure_sorted();
+                }
+
+                // Check for new duplicate groups and delete immediately
+                for group in finder.groups() {
+                    if processed_groups.contains(&group.hash) {
+                        continue; // Already processed
+                    }
+
+                    processed_groups.insert(group.hash.clone());
+
+                    // Save to database
+                    let _ = db.save_duplicate_group(scan_id, group);
+
+                    // Determine which file to keep
+                    if let Some(keeper_index) = SuggestionEngine::get_best_keeper(&group.files) {
+                        let keeper_path = group.files[keeper_index].path.display().to_string();
+                        let file_size = group.files[0].size;
+
+                        println!("\n   {} {} duplicates ({}, hash: {}...)",
+                            "Found".bold(),
+                            group.files.len().to_string().yellow(),
+                            format_size(file_size, BINARY).dimmed(),
+                            &group.hash[..8].dimmed());
+                        println!("   {} {}", "✓ Keeping:".green().bold(), keeper_path);
+
+                        // Delete all files except the keeper
+                        for (i, file) in group.files.iter().enumerate() {
+                            if i == keeper_index {
+                                continue;
+                            }
+
+                            let result = if use_backup {
+                                backup_manager.delete_with_backup(&file.path).map(|_| ())
+                            } else {
+                                trash::delete(&file.path).map_err(|e| anyhow::anyhow!("Failed to move to trash: {}", e))
+                            };
+
+                            match result {
+                                Ok(_) => {
+                                    let method = if use_backup { "Deleted (backed up):" } else { "Moved to trash:" };
+                                    println!("   {} {}", method.red().bold(), file.path.display().to_string().dimmed());
+                                    total_deleted += 1;
+                                    total_space_freed += file.size;
+                                }
+                                Err(e) => {
+                                    eprintln!("   {} {}: {}",
+                                        "⚠ Failed to delete".yellow().bold(),
+                                        file.path.display(),
+                                        e.to_string().dimmed());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                break; // Scan complete
+            }
+        }
+    }
 
     let scan_elapsed = scan_start.elapsed();
     println!("\r   {} {} files in {:.2}s",
@@ -292,97 +398,8 @@ async fn yolo_scan(path: PathBuf, min_size: u64, max_size: u64, exclude_patterns
         scan_elapsed.as_secs_f64());
     println!();
 
-    // Process size groups to find duplicates
-    println!("{}", "🔍 Finding and removing duplicates...".bold().cyan());
-    println!();
-
-    for (_size, mut files) in size_groups_result {
-        if files.len() < 2 {
-            continue;
-        }
-
-        // Compute hashes for this size group
-        for file in &mut files {
-            let _ = file.get_or_compute_hash();
-        }
-
-        // Group by hash
-        let mut hash_groups: HashMap<String, Vec<scanner::FileInfo>> = HashMap::new();
-        for file in files {
-            if let Some(ref hash) = file.hash {
-                hash_groups
-                    .entry(hash.clone())
-                    .or_insert_with(Vec::new)
-                    .push(file);
-            }
-        }
-
-        // Process each hash group
-        for (hash, group_files) in hash_groups {
-            if group_files.len() < 2 {
-                continue;
-            }
-
-            // Save duplicate group to database
-            let dup_group = duplicates::DuplicateGroup::new(hash.clone(), group_files.clone());
-            let _ = db.save_duplicate_group(scan_id, &dup_group);
-            groups_found += 1;
-
-            // Determine which file to keep
-            let keeper_index = SuggestionEngine::get_best_keeper(&group_files);
-
-            if keeper_index.is_none() {
-                // Shouldn't happen, but be safe
-                continue;
-            }
-
-            let keeper_index = keeper_index.unwrap();
-            let keeper_path = group_files[keeper_index].path.display().to_string();
-            let file_size = group_files[0].size;
-
-            println!("   {} {} duplicates ({}, hash: {}...)",
-                "Found".bold(),
-                group_files.len().to_string().yellow(),
-                format_size(file_size, BINARY).dimmed(),
-                &hash[..8].dimmed());
-            println!("   {} {}", "✓ Keeping:".green().bold(), keeper_path);
-
-            // Delete all files except the keeper
-            for (i, file) in group_files.iter().enumerate() {
-                if i == keeper_index {
-                    continue;
-                }
-
-                let result = if use_backup {
-                    // Use backup method (copy then delete)
-                    backup_manager.delete_with_backup(&file.path).map(|_| ())
-                } else {
-                    // Use trash (move to recycle bin)
-                    trash::delete(&file.path).map_err(|e| anyhow::anyhow!("Failed to move to trash: {}", e))
-                };
-
-                match result {
-                    Ok(_) => {
-                        let method = if use_backup { "Deleted (backed up):" } else { "Moved to trash:" };
-                        println!("   {} {}", method.red().bold(), file.path.display().to_string().dimmed());
-                        total_deleted += 1;
-                        total_space_freed += file.size;
-                    }
-                    Err(e) => {
-                        eprintln!("   {} {}: {}",
-                            "⚠ Failed to delete".yellow().bold(),
-                            file.path.display(),
-                            e.to_string().dimmed());
-                    }
-                }
-            }
-
-            println!();
-        }
-    }
-
     // Complete scan in database
-    let _ = db.complete_scan(scan_id, total_scanned, groups_found);
+    let _ = db.complete_scan(scan_id, total_scanned, finder.groups().len());
 
     // Print summary
     let total_elapsed = start_time.elapsed();
@@ -392,6 +409,9 @@ async fn yolo_scan(path: PathBuf, min_size: u64, max_size: u64, exclude_patterns
     println!("   {}: {}",
         "Files scanned".bold(),
         total_scanned.to_string().bright_cyan());
+    println!("   {}: {}",
+        "Duplicate groups found".bold(),
+        finder.groups().len().to_string().bright_yellow());
     println!("   {}: {}",
         "Duplicates deleted".bold(),
         total_deleted.to_string().bright_red());

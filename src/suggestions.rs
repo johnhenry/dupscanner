@@ -208,12 +208,25 @@ fn is_in_downloads_directory(path: &Path) -> bool {
 }
 
 fn filename_contains_copy(path: &Path) -> bool {
+    // Check the filename
     if let Some(filename) = path.file_name() {
         let name_lower = filename.to_string_lossy().to_lowercase();
-        name_lower.contains("copy") || name_lower.contains("duplicate") || name_lower.contains("(1)")
-    } else {
-        false
+        if name_lower.contains("copy") || name_lower.contains("duplicate") || name_lower.contains("(1)") {
+            return true;
+        }
     }
+
+    // Also check the full path for copy indicators in directory names
+    let path_lower = path.to_string_lossy().to_lowercase();
+    path_lower.contains("copy")
+        || path_lower.contains("duplicate")
+        || path_lower.contains("(1)")
+        || path_lower.contains(" 2/")  // macOS/Windows copy: "folder 2"
+        || path_lower.contains(" 3/")
+        || path_lower.contains(" 2\\")  // Windows path
+        || path_lower.contains(" 3\\")
+        || path_lower.ends_with(" 2")
+        || path_lower.ends_with(" 3")
 }
 
 #[cfg(test)]

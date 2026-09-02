@@ -1,12 +1,13 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::{self, Receiver};
+use std::thread;
 use std::time::SystemTime;
-use walkdir::{DirEntry, WalkDir};
+use walkdir::WalkDir;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ScanConfig {
@@ -21,6 +22,43 @@ pub struct ScanConfig {
 
 fn default_batch_size() -> usize {
     1000
+}
+
+/// Get default exclusion patterns for common directories that should be skipped
+pub fn get_default_exclusions() -> Vec<String> {
+    vec![
+        // Version control
+        "*/.git/*".to_string(),
+        "*/.svn/*".to_string(),
+        "*/.hg/*".to_string(),
+
+        // Package managers and dependencies
+        "*/node_modules/*".to_string(),
+        "*/bower_components/*".to_string(),
+        "*/.npm/*".to_string(),
+        "*/.yarn/*".to_string(),
+
+        // Build artifacts
+        "*/target/*".to_string(),      // Rust
+        "*/dist/*".to_string(),         // General
+        "*/build/*".to_string(),        // General
+        "*/.next/*".to_string(),        // Next.js
+        "*/.nuxt/*".to_string(),        // Nuxt.js
+
+        // IDE and editor files
+        "*/.vscode/*".to_string(),
+        "*/.idea/*".to_string(),
+
+        // OS files
+        "*/.DS_Store".to_string(),
+        "*/Thumbs.db".to_string(),
+        "*/desktop.ini".to_string(),
+
+        // Cache directories
+        "*/.cache/*".to_string(),
+        "*/__pycache__/*".to_string(),
+        "*/.pytest_cache/*".to_string(),
+    ]
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
@@ -81,89 +119,98 @@ impl FileInfo {
 
 pub struct Scanner {
     config: ScanConfig,
-    size_groups: HashMap<u64, Vec<FileInfo>>,
-    scanned_count: usize,
-    total_size: u64,
 }
 
 impl Scanner {
     pub fn new(config: ScanConfig) -> Self {
         Scanner {
             config,
-            size_groups: HashMap::new(),
-            scanned_count: 0,
-            total_size: 0,
         }
     }
 
-    pub fn scan<F>(&mut self, mut progress_callback: F) -> Result<HashMap<u64, Vec<FileInfo>>>
-    where
-        F: FnMut(usize, &Path),
-    {
-        let walker = WalkDir::new(&self.config.root_path)
-            .follow_links(false)
-            .into_iter()
-            .filter_entry(|e| !is_hidden(e));
+    /// Scan in streaming mode - returns a channel that yields batches of files
+    pub fn scan_streaming(&self) -> (Receiver<Vec<FileInfo>>, Receiver<ScanProgress>) {
+        let (batch_tx, batch_rx) = mpsc::channel();
+        let (progress_tx, progress_rx) = mpsc::channel();
 
-        for entry in walker.filter_map(|e| e.ok()) {
-            if !entry.file_type().is_file() {
-                continue;
-            }
+        let config = self.config.clone();
 
-            let path = entry.path();
+        thread::spawn(move || {
+            let mut scanned_count = 0;
+            let mut total_size = 0;
+            let mut batch = Vec::with_capacity(config.batch_size);
 
-            // Check if path should be excluded
-            if should_exclude(path, &self.config.exclude_patterns) {
-                continue;
-            }
+            let walker = WalkDir::new(&config.root_path)
+                .follow_links(false)
+                .into_iter();
 
-            if let Ok(mut file_info) = FileInfo::from_path(path) {
-                // Filter by size
-                if file_info.size < self.config.min_size {
+            for entry in walker.filter_map(|e| e.ok()) {
+                if !entry.file_type().is_file() {
                     continue;
                 }
 
-                if let Some(max_size) = self.config.max_size {
-                    if file_info.size > max_size {
-                        continue;
-                    }
+                let path = entry.path();
+
+                // Check if path should be excluded
+                if should_exclude(path, &config.exclude_patterns) {
+                    continue;
                 }
 
-                // Compute quick hash during initial scan
-                let _ = file_info.compute_quick_hash(); // Best effort - continue even if it fails
+                if let Ok(file_info) = FileInfo::from_path(path) {
+                    // Filter by size
+                    if file_info.size < config.min_size {
+                        continue;
+                    }
 
-                self.scanned_count += 1;
-                self.total_size += file_info.size;
+                    if let Some(max_size) = config.max_size {
+                        if file_info.size > max_size {
+                            continue;
+                        }
+                    }
 
-                // Group by size
-                self.size_groups
-                    .entry(file_info.size)
-                    .or_insert_with(Vec::new)
-                    .push(file_info);
+                    // Don't compute hashes yet - defer until we know there are duplicates
+                    scanned_count += 1;
+                    total_size += file_info.size;
 
-                progress_callback(self.scanned_count, path);
+                    batch.push(file_info);
+
+                    // Send batch when it reaches the configured size
+                    if batch.len() >= config.batch_size {
+                        // Send progress update
+                        let _ = progress_tx.send(ScanProgress {
+                            scanned_count,
+                            total_size,
+                        });
+
+                        // Send batch to processor (replace with new empty batch)
+                        let full_batch = std::mem::replace(&mut batch, Vec::with_capacity(config.batch_size));
+                        if batch_tx.send(full_batch).is_err() {
+                            break; // Receiver dropped, stop scanning
+                        }
+                    }
+                }
             }
-        }
 
-        Ok(self.size_groups.clone())
-    }
+            // Send any remaining files in the last batch
+            if !batch.is_empty() {
+                let _ = progress_tx.send(ScanProgress {
+                    scanned_count,
+                    total_size,
+                });
+                let _ = batch_tx.send(batch);
+            }
 
-    #[allow(dead_code)]
-    pub fn get_potential_duplicates(&self) -> Vec<&Vec<FileInfo>> {
-        self.size_groups
-            .values()
-            .filter(|group| group.len() > 1)
-            .collect()
-    }
+            // Channels will be dropped here, signaling completion
+        });
 
-    #[allow(dead_code)]
-    pub fn scanned_count(&self) -> usize {
-        self.scanned_count
+        (batch_rx, progress_rx)
     }
+}
 
-    pub fn total_size(&self) -> u64 {
-        self.total_size
-    }
+#[derive(Debug, Clone)]
+pub struct ScanProgress {
+    pub scanned_count: usize,
+    pub total_size: u64,
 }
 
 pub fn compute_file_hash(path: &Path) -> Result<String> {
@@ -195,14 +242,6 @@ pub fn compute_quick_hash(path: &Path) -> Result<String> {
     hasher.update(&buffer[..bytes_read]);
 
     Ok(format!("{:x}", hasher.finalize()))
-}
-
-fn is_hidden(entry: &DirEntry) -> bool {
-    entry
-        .file_name()
-        .to_str()
-        .map(|s| s.starts_with('.'))
-        .unwrap_or(false)
 }
 
 fn should_exclude(path: &Path, patterns: &[String]) -> bool {

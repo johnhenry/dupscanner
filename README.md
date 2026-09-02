@@ -14,9 +14,18 @@ A powerful, terminal-based duplicate file scanner written in Rust with an intuit
 
 #### 2. **Exclusion Patterns** 🎯
 - Glob-based pattern matching for flexible file filtering
-- Exclude files/directories from scans
+- **Default exclusions**: Common directories automatically skipped (.git/, node_modules/, target/, .cache/, etc.)
+- Add custom patterns with `--exclude`
+- Disable defaults with `--no-default-excludes`
 - Multiple patterns supported simultaneously
-- **Example**: `--exclude "*.tmp" --exclude "*/node_modules/*" --exclude "*/.git/*"`
+- **Default exclusions include**:
+  - Version control: `.git/`, `.svn/`, `.hg/`
+  - Dependencies: `node_modules/`, `bower_components/`
+  - Build artifacts: `target/`, `dist/`, `build/`, `.next/`, `.nuxt/`
+  - Caches: `.cache/`, `__pycache__/`, `.pytest_cache/`
+  - IDE files: `.vscode/`, `.idea/`
+  - OS files: `.DS_Store`, `Thumbs.db`, `desktop.ini`
+- **Example**: `--exclude "*.tmp" --exclude "*/backup/*"`
 
 #### 3. **Beautiful Console Output** 🎨
 - Color-coded output (green=success, red=delete, yellow=warning)
@@ -37,7 +46,7 @@ A powerful, terminal-based duplicate file scanner written in Rust with an intuit
 - Review any completed scan with `dupscanner view <id>`
 - Integration-ready for web interface
 - **Schema**: scans, files, and indexes for performance
-- **Database location**: `~/.local/share/dupscanner/scans.db`
+- **Database location**: Per-directory `.dupscanner/scans.db` in scan root (with in-memory fallback for read-only directories)
 
 #### 6. **Intelligent Suggestions** 🧠
 Weighted scoring system to identify best file to keep:
@@ -53,9 +62,10 @@ Weighted scoring system to identify best file to keep:
 - **Optional backup mode**: Copy files before deletion with `--use-backup`
 - All deletions are reversible
 - Trash location: System recycle bin (Trash on macOS, Recycle Bin on Windows, Trash on Linux)
-- Backup location: `~/.local/share/dupscanner/backups/` (when using --use-backup)
+- Backup location: Per-directory `.dupscanner/backups/` in scan root (when using --use-backup)
 - State persistence for crash recovery
 - Manual file selection with visual feedback
+- **Automatic fallback**: In-memory database when scan directory is read-only
 
 ### Additional Features
 - **Interactive TUI**: Beautiful terminal interface with keyboard navigation
@@ -107,7 +117,10 @@ dupscanner scan /tmp/dupscanner-demo
 
 ### Basic Scan
 ```bash
-# Scan a directory
+# Scan current directory (default)
+dupscanner scan
+
+# Scan a specific directory
 dupscanner scan /path/to/directory
 
 # Scan with minimum file size (10KB)
@@ -122,12 +135,17 @@ dupscanner scan /path/to/directory --save-state
 # Resume previous scan
 dupscanner scan /path/to/directory --resume
 
-# Exclude files/directories with glob patterns
+# Common directories (.git/, node_modules/, etc.) are excluded by default
+# Add custom exclusion patterns with --exclude
 dupscanner scan /path/to/directory \
   --exclude "*.tmp" \
-  --exclude "*/node_modules/*" \
-  --exclude "*/.git/*" \
-  --exclude "*/target/*"
+  --exclude "*/backup/*"
+
+# Scan everything including .git/, node_modules/, etc.
+dupscanner scan /path/to/directory --no-default-excludes
+
+# Combine: disable defaults and add custom patterns
+dupscanner scan /path/to/directory --no-default-excludes --exclude "*.log"
 ```
 
 ### YOLO Mode (Automatic Non-Interactive)
@@ -149,10 +167,13 @@ dupscanner scan /path/to/directory --yolo --use-backup
 # YOLO with size constraints
 dupscanner scan ~/Downloads --yolo --min-size 1048576  # Only files >1MB
 
-# YOLO with exclusion patterns
+# YOLO with custom exclusion patterns (in addition to defaults)
 dupscanner scan ~/Documents --yolo \
   --exclude "*.tmp" \
-  --exclude "*/node_modules/*"
+  --exclude "*/backup/*"
+
+# YOLO without default exclusions (scan everything)
+dupscanner scan ~/Documents --yolo --no-default-excludes
 ```
 
 **How YOLO Mode Works:**
@@ -248,7 +269,106 @@ dupscanner history
 dupscanner view 1
 ```
 
+## How Auto-Suggestions Work
+
+When you press `a` or `A`, DupScanner uses **heuristics** (educated guesses) to suggest which duplicates to delete:
+
+### Scoring System
+
+Files are scored based on these criteria:
+
+| Reason | Score | Example |
+|--------|-------|---------|
+| **In temp directory** | 100 | `/tmp/file.txt`, `C:\temp\file.txt` |
+| **Has "copy" in name/path** | 80 | `file copy.txt`, `folder 2/file.txt` |
+| **In downloads directory** | 60 | `~/Downloads/file.txt` |
+| **Deeper path** | 40 | `./a/b/c/file.txt` vs `./file.txt` |
+| **Longer filename** | 30 | `file_with_long_name.txt` vs `file.txt` |
+| **Newer file** | 20 | Modified today vs modified last year |
+
+### Confidence Levels
+
+- **High confidence (100+)**: File in `/tmp/` or multiple strong indicators
+- **Good confidence (80-99)**: Has "copy" in name/path
+- **Medium confidence (60-79)**: In downloads, or multiple weak indicators
+- **Low confidence (<60)**: Only minor differences detected
+
+### File Labels in TUI
+
+Each file in a duplicate group is labeled to show its status:
+
+- **`(score: 80)`** in **red** = Suggested for deletion (higher score = more confident)
+- **`(KEEPER)`** in **green** = Will be kept (best file in group)
+- **`(neutral)`** in **gray** = No negative indicators, but not selected as keeper
+
+### Important Notes
+
+⚠️ **These are suggestions, not certainties!** Always review the marked files before deleting:
+
+1. Check the **labels** next to each file to understand why they were scored
+2. Read the **status message** showing confidence level
+3. Use `n`/`p` to navigate and review each group
+4. Toggle with `Space` to adjust selections
+5. For identical files with no clear winner, use `o` (keep oldest) instead
+
+**Example**:
+```
+[ ] ./folder/file.fits (KEEPER)
+[X] ./folder 2/file.fits (score: 80)
+```
+The second file gets score 80 because of the `" 2"` in the path - but both files might be equally valid!
+
+## Default Exclusions
+
+DupScanner automatically excludes common directories that typically don't need scanning:
+
+| Category | Patterns |
+|----------|----------|
+| **Version Control** | `.git/`, `.svn/`, `.hg/` |
+| **Dependencies** | `node_modules/`, `bower_components/`, `.npm/`, `.yarn/` |
+| **Build Artifacts** | `target/` (Rust), `dist/`, `build/`, `.next/` (Next.js), `.nuxt/` (Nuxt.js) |
+| **Caches** | `.cache/`, `__pycache__/` (Python), `.pytest_cache/` |
+| **IDE Files** | `.vscode/`, `.idea/` |
+| **OS Files** | `.DS_Store` (macOS), `Thumbs.db` (Windows), `desktop.ini` (Windows) |
+
+**To disable default exclusions**: Use the `--no-default-excludes` flag
+**To add custom exclusions**: Use the `--exclude` flag (can be used multiple times)
+
+```bash
+# Use defaults + add custom patterns
+dupscanner scan . --exclude "*.bak" --exclude "*/temp/*"
+
+# Disable defaults (scan everything)
+dupscanner scan . --no-default-excludes
+
+# Disable defaults + add specific exclusions
+dupscanner scan . --no-default-excludes --exclude "*/.git/*"
+```
+
 ## TUI Controls
+
+### Quick Reference
+
+| Key | Action | Scope |
+|-----|--------|-------|
+| **Navigation** |||
+| `j` / `↓` | Select next file | Current group |
+| `k` / `↑` | Select previous file | Current group |
+| `n` / `→` | Next duplicate group | - |
+| `p` / `←` | Previous duplicate group | - |
+| **Marking** |||
+| `Space` | Toggle mark file | Current file |
+| `a` | Auto-mark suggested files | Current group |
+| `A` (Shift+A) | Auto-mark suggested files | **ALL groups** |
+| `o` | Mark all except oldest | Current group |
+| `O` (Shift+O) | Mark all except oldest | **ALL groups** |
+| **Deleting** |||
+| `d` | Delete marked files | Current group |
+| `D` (Shift+D) | Delete marked files | **ALL groups** |
+| **Other** |||
+| `s` | Save state | - |
+| `?` | Toggle help | - |
+| `q` | Quit | - |
 
 ### Navigation
 - `j` / `Down Arrow` - Select next file in current group
@@ -258,9 +378,19 @@ dupscanner view 1
 
 ### Actions
 - `Space` - Toggle mark file for deletion
-- `a` - Auto-mark suggested files (smart: marks bad locations/names, always keeps best file)
-- `o` - Mark all except oldest (aggressive: keeps only the oldest/best file)
-- `d` - Delete marked files (creates backup first)
+- `a` - Auto-mark suggested files in current group (smart: marks bad locations/names, always keeps best file)
+- `A` (Shift+A) - Auto-mark suggested files across ALL groups
+  - Marks persist as you navigate between groups
+  - Shows status message with count
+  - Navigate with `n`/`p` to review marked files in each group
+- `o` - Mark all except oldest in current group (aggressive: keeps only the oldest/best file)
+- `O` (Shift+O) - Mark all except oldest across ALL groups
+  - Marks persist as you navigate between groups
+  - Shows total count marked
+- `d` - Delete marked files in current group (creates backup first)
+- `D` (Shift+D) - Delete ALL marked files across all groups (creates backup first)
+  - Works on any files marked with Space, `a`, `A`, `o`, or `O`
+  - Shows total count deleted across all groups
 - `s` - Save current state
 
 ### Other
@@ -429,16 +559,34 @@ For a directory with 10,000 large files (each >64KB):
 ```bash
 dupscanner scan ~/Downloads --min-size 1048576 --save-state
 # Scans Downloads for files >1MB, saves state
-# In TUI: press 'a' to auto-mark suggested duplicates
-# Review marked files, press 'd' to delete
+
+# Quick workflow:
+# 1. Press 'A' (Shift+A) to auto-mark suggested duplicates across ALL groups
+# 2. Navigate with 'n'/'p' to review marked files in each group
+# 3. Press 'D' (Shift+D) to delete all marked files at once
+
+# Or delete group by group:
+# 1. Press 'a' to auto-mark suggested duplicates in current group
+# 2. Press 'd' to delete marked files
+# 3. Press 'n' to go to next group, repeat
 ```
 
 ### Example 2: Large Media Library
 ```bash
 dupscanner scan /media/photos --min-size 10240
 # Scans photos, minimum 10KB
-# Navigate through duplicate groups with 'n'/'p'
-# Use 'o' to mark all except oldest in each group
+
+# Recommended workflow for batch cleanup:
+#   1. Press 'A' (Shift+A) to auto-mark all suggested duplicates across all groups
+#   2. Navigate through groups with 'n'/'p' to review what will be deleted
+#   3. Use Space to toggle individual files if needed
+#   4. Press 'D' (Shift+D) once to delete all marked files across all groups
+
+# Alternative per-group workflow:
+#   1. Navigate to each group with 'n'/'p'
+#   2. Use 'o' to mark all except oldest (or 'a' for smart suggestions)
+#   3. Press 'd' to delete marked files in current group
+#   4. Repeat for next group
 ```
 
 ### Example 3: System-wide Scan
@@ -489,17 +637,19 @@ dupscanner scan /tmp/dup-test
 - Saves state to prevent data loss
 
 ### What DupScanner Does NOT Do
-- Auto-delete files without user confirmation
+- Auto-delete files without user confirmation (except in YOLO mode)
 - Delete the last remaining copy of any file
 - Cross filesystem boundaries by default
 - Follow symbolic links (prevents loops)
+- Scan version control, dependencies, or build directories by default (use `--no-default-excludes` to scan everything)
 
 ### Best Practices
 1. Always use `--save-state` for large scans
 2. Review suggestions before deleting
 3. Keep backups for at least 30 days
 4. Test on small directories first
-5. Exclude system directories (`/etc`, `/bin`, etc.)
+5. Default exclusions skip common directories (.git/, node_modules/, etc.) - use `--exclude` to add more patterns
+6. Use `--no-default-excludes` carefully - it will scan build artifacts and dependencies
 
 ## Troubleshooting
 

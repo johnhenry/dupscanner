@@ -34,6 +34,19 @@ impl BackupManager {
         })
     }
 
+    pub fn new_with_dir(custom_dir: PathBuf) -> Result<Self> {
+        let backup_dir = custom_dir.join("backups");
+
+        if !backup_dir.exists() {
+            fs::create_dir_all(&backup_dir)?;
+        }
+
+        Ok(BackupManager {
+            backup_dir,
+            records: Vec::new(),
+        })
+    }
+
     pub fn backup_file(&mut self, file_path: &Path) -> Result<PathBuf> {
         if !file_path.exists() {
             anyhow::bail!("File does not exist: {}", file_path.display());
@@ -49,10 +62,28 @@ impl BackupManager {
             .context("Invalid filename")?
             .to_string_lossy();
 
+        // Truncate filename if too long to prevent filesystem errors
+        // Most filesystems limit filenames to 255 bytes
+        // Reserve ~30 chars for timestamp and extension
+        let max_filename_len = 200;
+        let truncated_filename = if filename.len() > max_filename_len {
+            // Keep the extension if present
+            if let Some(ext_pos) = filename.rfind('.') {
+                let name_part = &filename[..ext_pos];
+                let ext_part = &filename[ext_pos..];
+                let truncate_len = max_filename_len.saturating_sub(ext_part.len()).saturating_sub(3);
+                format!("{}...{}", &name_part[..truncate_len.min(name_part.len())], ext_part)
+            } else {
+                format!("{}...", &filename[..max_filename_len - 3])
+            }
+        } else {
+            filename.to_string()
+        };
+
         let backup_filename = format!(
             "{}_{}.bak",
             timestamp.format("%Y%m%d_%H%M%S"),
-            filename
+            truncated_filename
         );
 
         let backup_path = self.backup_dir.join(backup_filename);

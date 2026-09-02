@@ -19,3 +19,13 @@ Cargo.lock
 # Build artifacts
 /release/
 /debug/
+
+# Local scan data and scratch
+test_dir/
+.dupscanner/
+*.db
+*.db-shm
+*.db-wal
+
+# Editor/agent local config
+.claude/

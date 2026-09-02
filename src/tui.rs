@@ -1,4 +1,4 @@
-use crate::app::{App, AppState};
+use crate::app::{App, AppState, ViewMode, StorageLocation};
 use crate::suggestions::SuggestionEngine;
 use anyhow::Result;
 use crossterm::{
@@ -15,7 +15,6 @@ use ratatui::{
     Frame, Terminal,
 };
 use std::io;
-use std::path::Path;
 use std::time::Duration;
 
 pub async fn run(app: &mut App) -> Result<()> {
@@ -48,11 +47,17 @@ pub async fn run(app: &mut App) -> Result<()> {
 async fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Result<()> {
     // Start scanning if needed
     if app.state == AppState::Scanning && !app.scan_complete {
-        scan_files(terminal, app).await?;
+        // Start streaming scan instead of batch scan
+        app.start_streaming_scan();
     }
 
     // Main event loop
     loop {
+        // Process incoming files if in streaming mode
+        if app.streaming_mode && !app.scan_complete {
+            app.process_incoming_files();
+        }
+
         terminal.draw(|f| ui(f, app))?;
 
         if event::poll(Duration::from_millis(100))? {
@@ -71,11 +76,11 @@ async fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Resul
                             _ => {}
                         }
                     }
-                    AppState::FindingDuplicates => {
-                        // Just wait for this to complete
-                    }
                     AppState::ReviewingDuplicates => {
-                        if app.show_help {
+                        // Tab key cycles through views regardless of current view
+                        if let KeyCode::Tab = key.code {
+                            app.cycle_view();
+                        } else if app.show_help {
                             if let KeyCode::Char('?') | KeyCode::Esc = key.code {
                                 app.toggle_help();
                             }
@@ -106,12 +111,26 @@ async fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Resul
                                 KeyCode::Char('a') => {
                                     app.mark_all_suggested();
                                 }
+                                KeyCode::Char('A') => {
+                                    // Shift+A: Mark all suggested files across ALL groups
+                                    app.mark_all_suggested_all_groups();
+                                }
                                 KeyCode::Char('o') => {
                                     app.mark_all_except_oldest();
+                                }
+                                KeyCode::Char('O') => {
+                                    // Shift+O: Mark all except oldest across ALL groups
+                                    app.mark_all_except_oldest_all_groups();
                                 }
                                 KeyCode::Char('d') => {
                                     if let Ok(count) = app.delete_marked_files() {
                                         app.set_status_message(format!("Deleted {} file(s)", count));
+                                    }
+                                }
+                                KeyCode::Char('D') => {
+                                    // Shift+D: Delete all marked files across ALL groups
+                                    if let Ok(count) = app.delete_marked_files_all_groups() {
+                                        app.set_status_message(format!("Deleted {} file(s) across all groups", count));
                                     }
                                 }
                                 KeyCode::Char('s') => {
@@ -124,8 +143,8 @@ async fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Resul
                     }
                 }
 
-                // Clear status message on next keypress
-                if !matches!(key.code, KeyCode::Char('s') | KeyCode::Char('d')) {
+                // Clear status message on next keypress (but not for commands that set status)
+                if !matches!(key.code, KeyCode::Char('s') | KeyCode::Char('a') | KeyCode::Char('A') | KeyCode::Char('o') | KeyCode::Char('O') | KeyCode::Char('d') | KeyCode::Char('D')) {
                     app.clear_status_message();
                 }
             }
@@ -133,35 +152,6 @@ async fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Resul
     }
 }
 
-async fn scan_files<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Result<()> {
-    let mut last_path = String::new();
-
-    if let Some(scanner) = &mut app.scanner {
-        let size_groups = scanner.scan(|count, path: &Path| {
-            app.scanned_count = count;
-            last_path = path.display().to_string();
-        })?;
-
-        app.total_size = scanner.total_size();
-        app.scan_complete = true;
-
-        // Update state
-        app.state = AppState::FindingDuplicates;
-        terminal.draw(|f| ui(f, app))?;
-
-        // Find duplicates
-        app.finder.find_duplicates(size_groups)?;
-
-        // Update state to reviewing
-        app.state = AppState::ReviewingDuplicates;
-        app.update_marked_for_deletion();
-
-        // Save initial state
-        app.save_state()?;
-    }
-
-    Ok(())
-}
 
 fn ui(f: &mut Frame, app: &App) {
     let chunks = Layout::default()
@@ -179,12 +169,11 @@ fn ui(f: &mut Frame, app: &App) {
     // Main content
     match app.state {
         AppState::Scanning => render_scanning(f, chunks[1], app),
-        AppState::FindingDuplicates => render_finding_duplicates(f, chunks[1], app),
         AppState::ReviewingDuplicates => {
-            if app.show_help {
-                render_help(f, chunks[1]);
-            } else {
-                render_duplicates(f, chunks[1], app);
+            match app.view_mode {
+                ViewMode::Duplicates => render_duplicates(f, chunks[1], app),
+                ViewMode::Statistics => render_statistics(f, chunks[1], app),
+                ViewMode::Help => render_help(f, chunks[1]),
             }
         }
     }
@@ -195,9 +184,20 @@ fn ui(f: &mut Frame, app: &App) {
 
 fn render_header(f: &mut Frame, area: Rect, app: &App) {
     let title = match app.state {
-        AppState::Scanning => "Scanning for Files",
-        AppState::FindingDuplicates => "Finding Duplicates",
-        AppState::ReviewingDuplicates => "Review Duplicate Files",
+        AppState::Scanning => "Scanning for Files".to_string(),
+        AppState::ReviewingDuplicates => {
+            let view_name = match app.view_mode {
+                ViewMode::Duplicates => "Duplicates",
+                ViewMode::Statistics => "Statistics",
+                ViewMode::Help => "Help",
+            };
+
+            if app.streaming_mode && !app.scan_complete {
+                format!("{} (Scanning in Progress...)", view_name)
+            } else {
+                view_name.to_string()
+            }
+        }
     };
 
     let header = Paragraph::new(title)
@@ -215,9 +215,23 @@ fn render_footer(f: &mut Frame, area: Rect, app: &App) {
         match app.state {
             AppState::Scanning => "q: quit | p: pause | s: save state".to_string(),
             AppState::ReviewingDuplicates => {
-                "q: quit | ?: help | j/k: select | n/p: next/prev group | space: mark | d: delete | a: auto-mark | o: keep oldest".to_string()
+                let base_commands = match app.view_mode {
+                    ViewMode::Duplicates => {
+                        if app.streaming_mode && !app.scan_complete {
+                            format!(
+                                "Scanning: {} files, {} groups | j/k: select | n/p: group | space: mark | d: delete",
+                                app.scanned_count,
+                                app.finder.groups().len()
+                            )
+                        } else {
+                            "j/k: select | n/p: group | space: mark | a/A: auto | o/O: oldest | d/D: delete".to_string()
+                        }
+                    }
+                    ViewMode::Statistics => "View statistics and scan progress".to_string(),
+                    ViewMode::Help => "Press Tab or ? to return".to_string(),
+                };
+                format!("{} | Tab: change view | q: quit", base_commands)
             }
-            _ => "q: quit".to_string(),
         }
     };
 
@@ -257,26 +271,6 @@ fn render_scanning(f: &mut Frame, area: Rect, app: &App) {
     let paragraph = Paragraph::new(text)
         .block(Block::default().borders(Borders::ALL).title("Progress"))
         .alignment(Alignment::Left);
-
-    f.render_widget(paragraph, area);
-}
-
-fn render_finding_duplicates(f: &mut Frame, area: Rect, app: &App) {
-    let text = vec![
-        Line::from("Finding duplicate files..."),
-        Line::from(""),
-        Line::from(vec![
-            Span::raw("Total files scanned: "),
-            Span::styled(
-                format!("{}", app.scanned_count),
-                Style::default().fg(Color::Green),
-            ),
-        ]),
-    ];
-
-    let paragraph = Paragraph::new(text)
-        .block(Block::default().borders(Borders::ALL).title("Processing"))
-        .alignment(Alignment::Center);
 
     f.render_widget(paragraph, area);
 }
@@ -360,21 +354,43 @@ fn render_files_panel(f: &mut Frame, area: Rect, app: &App) {
                     spans.push(Span::raw("[ ] "));
                 }
 
-                // Path
+                // Path (truncate if too long to prevent rendering issues)
                 let path_str = file.path.display().to_string();
+                let max_path_len = area.width.saturating_sub(20) as usize; // Leave room for checkbox and score
+                let truncated_path = if path_str.len() > max_path_len && max_path_len > 20 {
+                    format!("...{}", &path_str[path_str.len().saturating_sub(max_path_len - 3)..])
+                } else {
+                    path_str
+                };
                 let style = if is_selected {
                     Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
                 } else {
                     Style::default()
                 };
-                spans.push(Span::styled(path_str, style));
+                spans.push(Span::styled(truncated_path, style));
 
-                // Suggestion indicator
+                // Suggestion indicator - show for ALL files
                 if let Some(sugg) = suggestion {
+                    // File is suggested for deletion
                     spans.push(Span::styled(
                         format!(" (score: {})", sugg.score),
                         Style::default().fg(Color::Red),
                     ));
+                } else {
+                    // File is being kept (no suggestions against it)
+                    let keeper_index = SuggestionEngine::get_best_keeper(&group.files);
+                    if Some(i) == keeper_index {
+                        spans.push(Span::styled(
+                            " (KEEPER)",
+                            Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+                        ));
+                    } else {
+                        // File has no negative indicators, but isn't the keeper either
+                        spans.push(Span::styled(
+                            " (neutral)",
+                            Style::default().fg(Color::DarkGray),
+                        ));
+                    }
                 }
 
                 ListItem::new(Line::from(spans))
@@ -396,6 +412,124 @@ fn render_files_panel(f: &mut Frame, area: Rect, app: &App) {
     }
 }
 
+fn render_statistics(f: &mut Frame, area: Rect, app: &App) {
+    use humansize::{format_size as fmt_size, BINARY};
+
+    let scan_status = if app.streaming_mode && !app.scan_complete {
+        Span::styled("In Progress", Style::default().fg(Color::Yellow))
+    } else {
+        Span::styled("Complete", Style::default().fg(Color::Green))
+    };
+
+    let total_wasted: u64 = app.finder.groups().iter().map(|g| g.wasted_space).sum();
+    let total_marked: usize = app.marked_for_deletion_all_groups.values()
+        .map(|marks| marks.iter().filter(|&&m| m).count())
+        .sum();
+
+    // Get database and backup paths based on storage location
+    let (storage_type, db_path, backup_path) = match &app.storage_location {
+        StorageLocation::PerDirectory(dir) => (
+            "Per-Directory (.dupscanner)",
+            dir.join("scans.db").display().to_string(),
+            dir.join("backups").display().to_string(),
+        ),
+        StorageLocation::InMemory => (
+            "In-Memory Only (Read-Only Directory)",
+            ":memory: (not persisted)".to_string(),
+            "N/A (no backups in memory mode)".to_string(),
+        ),
+        StorageLocation::Global(dir) => (
+            "Global (Legacy)",
+            dir.join("scans.db").display().to_string(),
+            dir.join("backups").display().to_string(),
+        ),
+    };
+
+    let stats_text = vec![
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("Scan Information", Style::default().add_modifier(Modifier::BOLD).fg(Color::Cyan)),
+        ]),
+        Line::from(vec![
+            Span::raw("  Scan Location:  "),
+            Span::styled(app.config.root_path.display().to_string(), Style::default().fg(Color::White)),
+        ]),
+        Line::from(vec![
+            Span::raw("  Scan Status:    "),
+            scan_status,
+        ]),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("File Statistics", Style::default().add_modifier(Modifier::BOLD).fg(Color::Cyan)),
+        ]),
+        Line::from(vec![
+            Span::raw("  Files Scanned:  "),
+            Span::styled(format!("{}", app.scanned_count), Style::default().fg(Color::Green)),
+        ]),
+        Line::from(vec![
+            Span::raw("  Total Size:     "),
+            Span::styled(fmt_size(app.total_size, BINARY), Style::default().fg(Color::White)),
+        ]),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("Duplicate Information", Style::default().add_modifier(Modifier::BOLD).fg(Color::Cyan)),
+        ]),
+        Line::from(vec![
+            Span::raw("  Groups Found:   "),
+            Span::styled(format!("{}", app.finder.groups().len()), Style::default().fg(Color::Yellow)),
+        ]),
+        Line::from(vec![
+            Span::raw("  Wasted Space:   "),
+            Span::styled(fmt_size(total_wasted, BINARY), Style::default().fg(Color::Red)),
+        ]),
+        Line::from(vec![
+            Span::raw("  Files Marked:   "),
+            Span::styled(format!("{}", total_marked), Style::default().fg(Color::Magenta)),
+        ]),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("Storage Locations", Style::default().add_modifier(Modifier::BOLD).fg(Color::Cyan)),
+        ]),
+        Line::from(vec![
+            Span::raw("  Storage Mode:   "),
+            Span::styled(storage_type, Style::default().fg(Color::Yellow)),
+        ]),
+        Line::from(vec![
+            Span::raw("  Database:       "),
+            Span::styled(db_path, Style::default().fg(Color::White)),
+        ]),
+        Line::from(vec![
+            Span::raw("  Backups:        "),
+            Span::styled(backup_path, Style::default().fg(Color::White)),
+        ]),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("Scan Settings", Style::default().add_modifier(Modifier::BOLD).fg(Color::Cyan)),
+        ]),
+        Line::from(vec![
+            Span::raw("  Min File Size:  "),
+            Span::styled(fmt_size(app.config.min_size, BINARY), Style::default().fg(Color::White)),
+        ]),
+        Line::from(vec![
+            Span::raw("  Max File Size:  "),
+            Span::styled(
+                app.config.max_size.map_or("Unlimited".to_string(), |s| fmt_size(s, BINARY)),
+                Style::default().fg(Color::White)
+            ),
+        ]),
+        Line::from(vec![
+            Span::raw("  Batch Size:     "),
+            Span::styled(format!("{} files", app.config.batch_size), Style::default().fg(Color::White)),
+        ]),
+    ];
+
+    let stats = Paragraph::new(stats_text)
+        .block(Block::default().borders(Borders::ALL).title("Statistics"))
+        .alignment(Alignment::Left);
+
+    f.render_widget(stats, area);
+}
+
 fn render_help(f: &mut Frame, area: Rect) {
     let help_text = vec![
         Line::from(""),
@@ -407,13 +541,17 @@ fn render_help(f: &mut Frame, area: Rect) {
         Line::from(""),
         Line::from(Span::styled("Actions", Style::default().add_modifier(Modifier::BOLD))),
         Line::from("  Space       - Toggle mark file for deletion"),
-        Line::from("  a           - Auto-mark suggested files"),
-        Line::from("  o           - Mark all except oldest"),
-        Line::from("  d           - Delete marked files (with backup)"),
+        Line::from("  a           - Auto-mark suggested files (current group)"),
+        Line::from("  A (Shift+A) - Auto-mark suggested files (ALL groups)"),
+        Line::from("  o           - Mark all except oldest (current group)"),
+        Line::from("  O (Shift+O) - Mark all except oldest (ALL groups)"),
+        Line::from("  d           - Delete marked files in current group (with backup)"),
+        Line::from("  D (Shift+D) - Delete ALL marked files across all groups (with backup)"),
         Line::from("  s           - Save current state"),
         Line::from(""),
         Line::from(Span::styled("Other", Style::default().add_modifier(Modifier::BOLD))),
-        Line::from("  ?           - Toggle this help"),
+        Line::from("  Tab         - Change view (Duplicates/Statistics/Help)"),
+        Line::from("  ?           - Toggle help"),
         Line::from("  q           - Quit"),
         Line::from(""),
         Line::from(Span::styled("Files are backed up before deletion!", Style::default().fg(Color::Green))),

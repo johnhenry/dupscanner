@@ -41,6 +41,11 @@ pub struct DuplicateFinder {
     groups: Vec<DuplicateGroup>,
     total_duplicates: usize,
     total_wasted_space: u64,
+    // For incremental processing
+    size_groups: HashMap<u64, Vec<FileInfo>>,
+    hash_groups: HashMap<String, Vec<FileInfo>>,
+    needs_sort: bool,
+    needs_stats_update: bool,
 }
 
 impl DuplicateFinder {
@@ -49,65 +54,111 @@ impl DuplicateFinder {
             groups: Vec::new(),
             total_duplicates: 0,
             total_wasted_space: 0,
+            size_groups: HashMap::new(),
+            hash_groups: HashMap::new(),
+            needs_sort: false,
+            needs_stats_update: false,
         }
     }
 
-    pub fn find_duplicates(&mut self, size_groups: HashMap<u64, Vec<FileInfo>>) -> Result<()> {
-        let mut hash_map: HashMap<String, Vec<FileInfo>> = HashMap::new();
+    /// Process a single file incrementally - checks for duplicates as files arrive
+    pub fn process_file(&mut self, mut file: FileInfo) -> Result<()> {
+        let size = file.size;
 
-        // Only process size groups with multiple files
-        for (_, files) in size_groups {
-            if files.len() < 2 {
-                continue;
-            }
+        // Add to size group
+        let size_group = self.size_groups.entry(size).or_insert_with(Vec::new);
 
-            // Phase 1: Group by quick hash
-            let mut quick_hash_groups: HashMap<String, Vec<FileInfo>> = HashMap::new();
-            for file in files {
-                if let Some(ref quick_hash) = file.quick_hash {
-                    quick_hash_groups
-                        .entry(quick_hash.clone())
-                        .or_insert_with(Vec::new)
-                        .push(file);
-                }
-            }
+        // Check if we have a size duplicate
+        let has_size_duplicate = !size_group.is_empty();
 
-            // Phase 2: Only compute full hashes for files with matching quick hashes
-            for (_, mut quick_hash_group) in quick_hash_groups {
-                if quick_hash_group.len() < 2 {
-                    continue; // Skip files with unique quick hashes
-                }
+        size_group.push(file.clone());
 
-                // Compute full hashes only for potential duplicates
-                for file in &mut quick_hash_group {
-                    if let Ok(hash) = file.get_or_compute_hash() {
-                        hash_map
-                            .entry(hash.to_string())
-                            .or_insert_with(Vec::new)
-                            .push(file.clone());
-                    }
-                }
+        if !has_size_duplicate {
+            return Ok(()); // First file of this size, no duplicates yet
+        }
+
+        // We have a size duplicate! Now compute quick_hash for this file AND
+        // any other files in the group that don't have it yet
+        if file.quick_hash.is_none() {
+            let _ = file.compute_quick_hash();
+        }
+
+        // Compute quick_hash for other files in this size group if not already done
+        let size_group = self.size_groups.get_mut(&size).unwrap();
+        for other_file in size_group.iter_mut() {
+            if other_file.quick_hash.is_none() && other_file.path != file.path {
+                let _ = other_file.compute_quick_hash();
             }
         }
 
-        // Create duplicate groups from hash map
-        for (hash, files) in hash_map {
-            if files.len() > 1 {
-                let group = DuplicateGroup::new(hash, files);
-                self.total_duplicates += group.file_count();
-                self.total_wasted_space += group.wasted_space;
-                self.groups.push(group);
-            }
+        // Now check for quick_hash matches
+        let file_qh = file.quick_hash.as_ref();
+        let has_quick_hash_match = if let Some(qh) = file_qh {
+            size_group.iter().any(|f| {
+                f.path != file.path && f.quick_hash.as_ref() == Some(qh)
+            })
+        } else {
+            false
+        };
+
+        if !has_quick_hash_match {
+            return Ok(()); // No quick_hash matches, not duplicates
         }
 
-        // Sort groups by wasted space (descending)
-        self.groups.sort_by(|a, b| b.wasted_space.cmp(&a.wasted_space));
+        // We have a quick_hash match! Compute full hash
+        if file.hash.is_none() {
+            let _ = file.get_or_compute_hash();
+        }
+
+        if let Some(ref hash) = file.hash {
+            // Add to hash groups and check if we need to update
+            let hash_clone = hash.clone();
+            let should_update = {
+                let hash_group = self.hash_groups.entry(hash_clone.clone()).or_insert_with(Vec::new);
+                hash_group.push(file.clone());
+                hash_group.len() >= 2
+            };
+
+            // Update the duplicate group (but defer sorting) - done outside the borrow
+            if should_update {
+                let files = self.hash_groups.get(&hash_clone).unwrap().clone();
+                self.update_duplicate_group_deferred(hash_clone, files);
+            }
+        }
 
         Ok(())
     }
 
+    fn update_duplicate_group_deferred(&mut self, hash: String, files: Vec<FileInfo>) {
+        // Find existing group or create new one
+        if let Some(group) = self.groups.iter_mut().find(|g| g.hash == hash) {
+            // Update existing group
+            *group = DuplicateGroup::new(hash, files);
+        } else {
+            // Create new group
+            let group = DuplicateGroup::new(hash, files);
+            self.groups.push(group);
+        }
+
+        // Mark that we need to sort later (don't sort on every update)
+        self.needs_sort = true;
+        self.needs_stats_update = true;
+    }
+
     pub fn groups(&self) -> &[DuplicateGroup] {
         &self.groups
+    }
+
+    /// Call this before displaying groups to ensure they're sorted
+    pub fn ensure_sorted(&mut self) {
+        if self.needs_sort {
+            self.groups.sort_by(|a, b| b.wasted_space.cmp(&a.wasted_space));
+            self.needs_sort = false;
+        }
+        if self.needs_stats_update {
+            self.recalculate_stats();
+            self.needs_stats_update = false;
+        }
     }
 
     pub fn groups_mut(&mut self) -> &mut Vec<DuplicateGroup> {

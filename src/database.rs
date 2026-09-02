@@ -7,12 +7,53 @@ use crate::duplicates::DuplicateGroup;
 #[allow(dead_code)]
 pub struct ScanDatabase {
     conn: Connection,
+    is_in_memory: bool,
+    db_path: Option<PathBuf>,
 }
 
 impl ScanDatabase {
     pub fn open(path: &Path) -> Result<Self> {
         let conn = Connection::open(path)?;
+        Self::init_tables(&conn)?;
 
+        Ok(ScanDatabase {
+            conn,
+            is_in_memory: false,
+            db_path: Some(path.to_path_buf()),
+        })
+    }
+
+    pub fn open_in_memory() -> Result<Self> {
+        let conn = Connection::open_in_memory()?;
+        Self::init_tables(&conn)?;
+
+        Ok(ScanDatabase {
+            conn,
+            is_in_memory: true,
+            db_path: None,
+        })
+    }
+
+    pub fn open_or_in_memory(path: &Path) -> Self {
+        // Try to open file-based database first
+        if let Ok(db) = Self::open(path) {
+            return db;
+        }
+
+        // Fall back to in-memory database
+        Self::open_in_memory().expect("Failed to create in-memory database")
+    }
+
+    pub fn is_in_memory(&self) -> bool {
+        self.is_in_memory
+    }
+
+    #[allow(dead_code)]
+    pub fn db_path(&self) -> Option<&Path> {
+        self.db_path.as_deref()
+    }
+
+    fn init_tables(conn: &Connection) -> Result<()> {
         conn.execute(
             "CREATE TABLE IF NOT EXISTS scans (
                 id INTEGER PRIMARY KEY,
@@ -49,7 +90,7 @@ impl ScanDatabase {
             [],
         )?;
 
-        Ok(ScanDatabase { conn })
+        Ok(())
     }
 
     pub fn start_scan(&self, root_path: &Path) -> Result<i64> {
