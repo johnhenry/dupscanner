@@ -1,32 +1,38 @@
 [package]
 name = "dupscanner"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
-authors = ["Claude Code"]
-description = "An intelligent duplicate file scanner with TUI"
+authors = ["John Henry"]
+description = "Duplicate file scanner with an interactive TUI and a local web UI"
+license = "MIT"
+repository = "https://github.com/johnhenry/dupscanner"
 
 [dependencies]
+anyhow = "1.0"
+axum = { version = "0.7", features = ["json", "query"] }
+chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4.5", features = ["derive"] }
-ratatui = "0.28"
+colored = "2.1"
 crossterm = "0.28"
-tokio = { version = "1.40", features = ["full"] }
-walkdir = "2.5"
-sha2 = "0.10"
+dirs = "5.0"
+futures-util = "0.3"
+glob = "0.3"
+humansize = "2.1"
+mime_guess = "2.0"
+open = "5.3"
+percent-encoding = "2.3"
+rand = "0.8"
+ratatui = "0.28"
+rayon = "1.10"
+rusqlite = { version = "0.32", features = ["bundled"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-chrono = { version = "0.4", features = ["serde"] }
-anyhow = "1.0"
-thiserror = "1.0"
-indicatif = "0.17"
-colored = "2.1"
-rayon = "1.10"
-humansize = "2.1"
-dirs = "5.0"
-md5 = "0.7"
-rand = "0.8"
-glob = "0.3"
-rusqlite = { version = "0.32", features = ["bundled"] }
+sha2 = "0.10"
+tokio = { version = "1.40", features = ["rt-multi-thread", "macros", "sync", "time", "net", "fs", "io-util"] }
+tokio-stream = { version = "0.1", features = ["sync"] }
+tower-http = { version = "0.5", features = ["limit"] }
 trash = "5.1"
+walkdir = "2.5"
 
 [dev-dependencies]
 tempfile = "3.12"

@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use glob::Pattern;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fs::{self, File};
@@ -7,14 +8,16 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver};
 use std::thread;
 use std::time::SystemTime;
-use walkdir::WalkDir;
+use walkdir::{DirEntry, WalkDir};
+
+/// Size of the prefix hashed for the "quick hash" tier.
+pub const QUICK_HASH_BYTES: u64 = 64 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ScanConfig {
     pub root_path: PathBuf,
     pub min_size: u64,
     pub max_size: Option<u64>,
-    pub save_state: bool,
     pub exclude_patterns: Vec<String>,
     #[serde(default = "default_batch_size")]
     pub batch_size: usize,
@@ -24,49 +27,92 @@ fn default_batch_size() -> usize {
     1000
 }
 
-/// Get default exclusion patterns for common directories that should be skipped
+/// Default exclusion patterns for directories that almost never contain
+/// duplicates a user wants to act on. Directory patterns are matched against
+/// the directory *name* so the walker can prune whole subtrees.
 pub fn get_default_exclusions() -> Vec<String> {
-    vec![
+    [
         // Version control
-        "*/.git/*".to_string(),
-        "*/.svn/*".to_string(),
-        "*/.hg/*".to_string(),
-
+        ".git", ".svn", ".hg",
         // Package managers and dependencies
-        "*/node_modules/*".to_string(),
-        "*/bower_components/*".to_string(),
-        "*/.npm/*".to_string(),
-        "*/.yarn/*".to_string(),
-
+        "node_modules", "bower_components", ".npm", ".yarn",
         // Build artifacts
-        "*/target/*".to_string(),      // Rust
-        "*/dist/*".to_string(),         // General
-        "*/build/*".to_string(),        // General
-        "*/.next/*".to_string(),        // Next.js
-        "*/.nuxt/*".to_string(),        // Nuxt.js
-
+        "target", "dist", "build", ".next", ".nuxt",
         // IDE and editor files
-        "*/.vscode/*".to_string(),
-        "*/.idea/*".to_string(),
-
-        // OS files
-        "*/.DS_Store".to_string(),
-        "*/Thumbs.db".to_string(),
-        "*/desktop.ini".to_string(),
-
+        ".vscode", ".idea",
         // Cache directories
-        "*/.cache/*".to_string(),
-        "*/__pycache__/*".to_string(),
-        "*/.pytest_cache/*".to_string(),
+        ".cache", "__pycache__", ".pytest_cache",
+        // OS metadata files
+        ".DS_Store", "Thumbs.db", "desktop.ini",
+        // Data left behind by older dupscanner versions
+        ".dupscanner",
     ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect()
+}
+
+/// Compiled exclusion patterns. A pattern matches a path if it matches the
+/// full path string, the file/directory name, or (for `*/name/*` style
+/// patterns from older configs) the bare `name` component.
+#[derive(Debug, Clone)]
+pub struct ExclusionMatcher {
+    patterns: Vec<Pattern>,
+}
+
+impl ExclusionMatcher {
+    pub fn new(patterns: &[String]) -> Self {
+        let mut compiled = Vec::with_capacity(patterns.len());
+        for raw in patterns {
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            if let Ok(p) = Pattern::new(trimmed) {
+                compiled.push(p);
+            }
+            // Accept legacy "*/name/*" and "*/name" forms as a bare name too.
+            let mut stripped = trimmed;
+            if let Some(s) = stripped.strip_prefix("*/") {
+                stripped = s;
+            }
+            if let Some(s) = stripped.strip_suffix("/*") {
+                stripped = s;
+            }
+            if stripped != trimmed && !stripped.is_empty() {
+                if let Ok(p) = Pattern::new(stripped) {
+                    compiled.push(p);
+                }
+            }
+        }
+        ExclusionMatcher { patterns: compiled }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.patterns.is_empty()
+    }
+
+    pub fn matches(&self, path: &Path) -> bool {
+        if self.patterns.is_empty() {
+            return false;
+        }
+        let path_str = path.to_string_lossy();
+        let name = path.file_name().map(|n| n.to_string_lossy());
+        self.patterns.iter().any(|p| {
+            p.matches(&path_str)
+                || name.as_deref().map(|n| p.matches(n)).unwrap_or(false)
+        })
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct FileInfo {
     pub path: PathBuf,
     pub size: u64,
-    pub quick_hash: Option<String>,  // Hash of first 64KB for fast comparison
-    pub hash: Option<String>,         // Full file hash (computed lazily)
+    /// SHA-256 of the first 64 KiB, computed lazily.
+    pub quick_hash: Option<String>,
+    /// SHA-256 of the whole file, computed lazily.
+    pub hash: Option<String>,
     pub modified: SystemTime,
     pub depth: usize,
 }
@@ -75,8 +121,7 @@ impl FileInfo {
     pub fn from_path(path: &Path) -> Result<Self> {
         let metadata = fs::metadata(path)?;
         let size = metadata.len();
-        let modified = metadata.modified()?;
-
+        let modified = metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH);
         let depth = path.components().count();
 
         Ok(FileInfo {
@@ -90,7 +135,18 @@ impl FileInfo {
     }
 
     pub fn compute_hash(&mut self) -> Result<()> {
+        // For files that fit inside the quick-hash window the two hashes are
+        // identical, so reuse it instead of reading the file twice.
+        if self.size <= QUICK_HASH_BYTES {
+            if let Some(q) = &self.quick_hash {
+                self.hash = Some(q.clone());
+                return Ok(());
+            }
+        }
         let hash = compute_file_hash(&self.path)?;
+        if self.size <= QUICK_HASH_BYTES {
+            self.quick_hash = Some(hash.clone());
+        }
         self.hash = Some(hash);
         Ok(())
     }
@@ -99,21 +155,23 @@ impl FileInfo {
         if self.hash.is_none() {
             self.compute_hash()?;
         }
-        Ok(self.hash.as_ref().unwrap())
+        Ok(self.hash.as_deref().unwrap_or_default())
     }
 
     pub fn compute_quick_hash(&mut self) -> Result<()> {
         let hash = compute_quick_hash(&self.path)?;
+        if self.size <= QUICK_HASH_BYTES {
+            self.hash = Some(hash.clone());
+        }
         self.quick_hash = Some(hash);
         Ok(())
     }
 
-    #[allow(dead_code)]
     pub fn get_or_compute_quick_hash(&mut self) -> Result<&str> {
         if self.quick_hash.is_none() {
             self.compute_quick_hash()?;
         }
-        Ok(self.quick_hash.as_ref().unwrap())
+        Ok(self.quick_hash.as_deref().unwrap_or_default())
     }
 }
 
@@ -123,101 +181,115 @@ pub struct Scanner {
 
 impl Scanner {
     pub fn new(config: ScanConfig) -> Self {
-        Scanner {
-            config,
-        }
+        Scanner { config }
     }
 
-    /// Scan in streaming mode - returns a channel that yields batches of files
+    pub fn config(&self) -> &ScanConfig {
+        &self.config
+    }
+
+    /// Walk the tree on a background thread, sending batches of `FileInfo`
+    /// and progress updates. The batch channel is bounded so a fast walker
+    /// cannot run arbitrarily far ahead of a slow consumer.
     pub fn scan_streaming(&self) -> (Receiver<Vec<FileInfo>>, Receiver<ScanProgress>) {
-        let (batch_tx, batch_rx) = mpsc::channel();
+        let (batch_tx, batch_rx) = mpsc::sync_channel(4);
         let (progress_tx, progress_rx) = mpsc::channel();
 
         let config = self.config.clone();
+        let matcher = ExclusionMatcher::new(&config.exclude_patterns);
 
         thread::spawn(move || {
-            let mut scanned_count = 0;
-            let mut total_size = 0;
+            let mut scanned_count = 0usize;
+            let mut total_size = 0u64;
+            let mut skipped = 0usize;
             let mut batch = Vec::with_capacity(config.batch_size);
 
-            let walker = WalkDir::new(&config.root_path)
+            let root = config.root_path.clone();
+            let walker = WalkDir::new(&root)
                 .follow_links(false)
-                .into_iter();
+                .into_iter()
+                .filter_entry(|entry: &DirEntry| {
+                    // Never prune the root itself, even if its name matches.
+                    if entry.depth() == 0 {
+                        return true;
+                    }
+                    !matcher.matches(entry.path())
+                });
 
-            for entry in walker.filter_map(|e| e.ok()) {
+            for entry in walker {
+                let entry = match entry {
+                    Ok(e) => e,
+                    Err(_) => {
+                        skipped += 1;
+                        continue;
+                    }
+                };
                 if !entry.file_type().is_file() {
                     continue;
                 }
 
-                let path = entry.path();
-
-                // Check if path should be excluded
-                if should_exclude(path, &config.exclude_patterns) {
-                    continue;
-                }
-
-                if let Ok(file_info) = FileInfo::from_path(path) {
-                    // Filter by size
-                    if file_info.size < config.min_size {
+                let file_info = match FileInfo::from_path(entry.path()) {
+                    Ok(f) => f,
+                    Err(_) => {
+                        skipped += 1;
                         continue;
                     }
+                };
 
-                    if let Some(max_size) = config.max_size {
-                        if file_info.size > max_size {
-                            continue;
-                        }
+                if file_info.size < config.min_size {
+                    continue;
+                }
+                if let Some(max_size) = config.max_size {
+                    if file_info.size > max_size {
+                        continue;
                     }
+                }
 
-                    // Don't compute hashes yet - defer until we know there are duplicates
-                    scanned_count += 1;
-                    total_size += file_info.size;
+                scanned_count += 1;
+                total_size += file_info.size;
+                batch.push(file_info);
 
-                    batch.push(file_info);
-
-                    // Send batch when it reaches the configured size
-                    if batch.len() >= config.batch_size {
-                        // Send progress update
-                        let _ = progress_tx.send(ScanProgress {
-                            scanned_count,
-                            total_size,
-                        });
-
-                        // Send batch to processor (replace with new empty batch)
-                        let full_batch = std::mem::replace(&mut batch, Vec::with_capacity(config.batch_size));
-                        if batch_tx.send(full_batch).is_err() {
-                            break; // Receiver dropped, stop scanning
-                        }
+                if batch.len() >= config.batch_size {
+                    let _ = progress_tx.send(ScanProgress {
+                        scanned_count,
+                        total_size,
+                        skipped,
+                    });
+                    let full = std::mem::replace(&mut batch, Vec::with_capacity(config.batch_size));
+                    if batch_tx.send(full).is_err() {
+                        return; // Receiver dropped, stop scanning
                     }
                 }
             }
 
-            // Send any remaining files in the last batch
+            let _ = progress_tx.send(ScanProgress {
+                scanned_count,
+                total_size,
+                skipped,
+            });
             if !batch.is_empty() {
-                let _ = progress_tx.send(ScanProgress {
-                    scanned_count,
-                    total_size,
-                });
                 let _ = batch_tx.send(batch);
             }
-
-            // Channels will be dropped here, signaling completion
+            // Channels drop here, signalling completion.
         });
 
         (batch_rx, progress_rx)
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy, Default)]
 pub struct ScanProgress {
     pub scanned_count: usize,
     pub total_size: u64,
+    /// Entries that could not be read (permissions, vanished files, ...).
+    pub skipped: usize,
 }
 
 pub fn compute_file_hash(path: &Path) -> Result<String> {
     let file = File::open(path).context("Failed to open file for hashing")?;
-    let mut reader = BufReader::new(file);
+    let mut reader = BufReader::with_capacity(256 * 1024, file);
     let mut hasher = Sha256::new();
-    let mut buffer = vec![0; 8192];
+    let mut buffer = vec![0u8; 256 * 1024];
 
     loop {
         let count = reader.read(&mut buffer)?;
@@ -230,41 +302,22 @@ pub fn compute_file_hash(path: &Path) -> Result<String> {
     Ok(format!("{:x}", hasher.finalize()))
 }
 
-/// Compute quick hash of first 64KB of file for fast comparison
+/// SHA-256 of the first `QUICK_HASH_BYTES` of the file.
 pub fn compute_quick_hash(path: &Path) -> Result<String> {
     let file = File::open(path).context("Failed to open file for quick hashing")?;
-    let mut reader = BufReader::new(file);
+    let mut reader = BufReader::new(file).take(QUICK_HASH_BYTES);
     let mut hasher = Sha256::new();
-    let mut buffer = vec![0; 65536]; // 64KB buffer
+    let mut buffer = vec![0u8; 16 * 1024];
 
-    // Read only first 64KB
-    let bytes_read = reader.read(&mut buffer)?;
-    hasher.update(&buffer[..bytes_read]);
-
-    Ok(format!("{:x}", hasher.finalize()))
-}
-
-fn should_exclude(path: &Path, patterns: &[String]) -> bool {
-    use glob::Pattern;
-
-    let path_str = path.to_string_lossy();
-
-    for pattern_str in patterns {
-        if let Ok(pattern) = Pattern::new(pattern_str) {
-            if pattern.matches(&path_str) {
-                return true;
-            }
-
-            // Also check against just the filename
-            if let Some(filename) = path.file_name() {
-                if pattern.matches(&filename.to_string_lossy()) {
-                    return true;
-                }
-            }
+    loop {
+        let count = reader.read(&mut buffer)?;
+        if count == 0 {
+            break;
         }
+        hasher.update(&buffer[..count]);
     }
 
-    false
+    Ok(format!("{:x}", hasher.finalize()))
 }
 
 #[cfg(test)]
@@ -273,12 +326,16 @@ mod tests {
     use std::io::Write;
     use tempfile::TempDir;
 
+    fn write(path: &Path, bytes: &[u8]) {
+        let mut f = File::create(path).unwrap();
+        f.write_all(bytes).unwrap();
+    }
+
     #[test]
-    fn test_file_info_creation() {
+    fn file_info_creation() {
         let temp_dir = TempDir::new().unwrap();
         let file_path = temp_dir.path().join("test.txt");
-        let mut file = File::create(&file_path).unwrap();
-        file.write_all(b"test content").unwrap();
+        write(&file_path, b"test content");
 
         let file_info = FileInfo::from_path(&file_path).unwrap();
         assert_eq!(file_info.size, 12);
@@ -286,135 +343,89 @@ mod tests {
     }
 
     #[test]
-    fn test_hash_computation() {
+    fn hash_is_stable() {
         let temp_dir = TempDir::new().unwrap();
         let file_path = temp_dir.path().join("test.txt");
-        let mut file = File::create(&file_path).unwrap();
-        file.write_all(b"test content").unwrap();
+        write(&file_path, b"test content");
 
         let mut file_info = FileInfo::from_path(&file_path).unwrap();
         file_info.compute_hash().unwrap();
-        assert!(file_info.hash.is_some());
-
-        // Hash should be consistent
-        let hash1 = file_info.hash.clone();
+        let first = file_info.hash.clone();
+        file_info.hash = None;
         file_info.compute_hash().unwrap();
-        assert_eq!(hash1, file_info.hash);
+        assert_eq!(first, file_info.hash);
     }
 
     #[test]
-    fn test_quick_hash_computation() {
-        let temp_dir = TempDir::new().unwrap();
-        let file_path = temp_dir.path().join("test.txt");
-        let mut file = File::create(&file_path).unwrap();
-        file.write_all(b"test content").unwrap();
-
-        let mut file_info = FileInfo::from_path(&file_path).unwrap();
-        assert!(file_info.quick_hash.is_none());
-
-        file_info.compute_quick_hash().unwrap();
-        assert!(file_info.quick_hash.is_some());
-
-        // Quick hash should be consistent
-        let quick_hash1 = file_info.quick_hash.clone();
-        file_info.compute_quick_hash().unwrap();
-        assert_eq!(quick_hash1, file_info.quick_hash);
-    }
-
-    #[test]
-    fn test_quick_hash_vs_full_hash() {
+    fn quick_hash_equals_full_hash_for_small_files_only() {
         let temp_dir = TempDir::new().unwrap();
 
-        // Create a small file (less than 64KB)
-        let small_file = temp_dir.path().join("small.txt");
-        let mut file = File::create(&small_file).unwrap();
-        file.write_all(b"small content").unwrap();
-
-        let mut small_info = FileInfo::from_path(&small_file).unwrap();
+        let small = temp_dir.path().join("small.txt");
+        write(&small, b"small content");
+        let mut small_info = FileInfo::from_path(&small).unwrap();
         small_info.compute_quick_hash().unwrap();
-        small_info.compute_hash().unwrap();
-
-        // For small files, quick hash and full hash should be the same
+        // Small file: quick hash doubles as the full hash without a re-read.
         assert_eq!(small_info.quick_hash, small_info.hash);
+        assert_eq!(small_info.hash.as_deref(), Some(compute_file_hash(&small).unwrap().as_str()));
 
-        // Create a large file (more than 64KB)
-        let large_file = temp_dir.path().join("large.txt");
-        let mut file = File::create(&large_file).unwrap();
-        let large_content = vec![0u8; 128 * 1024]; // 128KB
-        file.write_all(&large_content).unwrap();
-
-        let mut large_info = FileInfo::from_path(&large_file).unwrap();
+        let large = temp_dir.path().join("large.bin");
+        write(&large, &vec![7u8; 128 * 1024]);
+        let mut large_info = FileInfo::from_path(&large).unwrap();
         large_info.compute_quick_hash().unwrap();
+        assert!(large_info.hash.is_none());
         large_info.compute_hash().unwrap();
-
-        // For large files, quick hash and full hash should be different
         assert_ne!(large_info.quick_hash, large_info.hash);
     }
 
     #[test]
-    fn test_exclusion_patterns() {
-        // Test basic filename pattern
-        assert!(should_exclude(
-            Path::new("/tmp/test.tmp"),
-            &["*.tmp".to_string()]
-        ));
-        assert!(!should_exclude(
-            Path::new("/tmp/test.txt"),
-            &["*.tmp".to_string()]
-        ));
-
-        // Test path pattern
-        assert!(should_exclude(
-            Path::new("/tmp/.git/config"),
-            &["*/.git/*".to_string()]
-        ));
-
-        // Test multiple patterns
-        assert!(should_exclude(
-            Path::new("/tmp/test.log"),
-            &["*.tmp".to_string(), "*.log".to_string()]
-        ));
-
-        // Test directory pattern
-        assert!(should_exclude(
-            Path::new("/tmp/node_modules/package.json"),
-            &["*/node_modules/*".to_string()]
-        ));
+    fn quick_hash_ignores_bytes_after_window() {
+        let temp_dir = TempDir::new().unwrap();
+        let a = temp_dir.path().join("a.bin");
+        let b = temp_dir.path().join("b.bin");
+        let mut data = vec![1u8; 100 * 1024];
+        write(&a, &data);
+        data[90 * 1024] = 2;
+        write(&b, &data);
+        assert_eq!(compute_quick_hash(&a).unwrap(), compute_quick_hash(&b).unwrap());
+        assert_ne!(compute_file_hash(&a).unwrap(), compute_file_hash(&b).unwrap());
     }
 
     #[test]
-    fn test_scanner_with_exclusions() {
-        use std::io::Write;
+    fn exclusion_matcher() {
+        let m = ExclusionMatcher::new(&["*.tmp".to_string(), "node_modules".to_string(), "*/.git/*".to_string()]);
+        assert!(m.matches(Path::new("/tmp/test.tmp")));
+        assert!(!m.matches(Path::new("/tmp/test.txt")));
+        assert!(m.matches(Path::new("/proj/node_modules")));
+        assert!(m.matches(Path::new("/proj/.git")));
+        assert!(m.matches(Path::new("/proj/.git/config")));
+        assert!(!m.matches(Path::new("/proj/src/main.rs")));
+    }
 
+    #[test]
+    fn scanner_prunes_excluded_directories_and_files() {
         let temp_dir = TempDir::new().unwrap();
-
-        // Create a subdirectory to avoid hidden directory issues
-        let test_dir = temp_dir.path().join("testdir");
-        fs::create_dir(&test_dir).unwrap();
-
-        // Create test files with content
-        let mut f1 = File::create(test_dir.join("include.txt")).unwrap();
-        f1.write_all(b"test content").unwrap();
-
-        let mut f2 = File::create(test_dir.join("exclude.tmp")).unwrap();
-        f2.write_all(b"excluded content").unwrap();
-
-        let mut f3 = File::create(test_dir.join("also_include.dat")).unwrap();
-        f3.write_all(b"more content").unwrap();
+        let root = temp_dir.path().join("root");
+        fs::create_dir_all(root.join("node_modules/pkg")).unwrap();
+        fs::create_dir_all(root.join("src")).unwrap();
+        write(&root.join("src/keep.txt"), b"keep me");
+        write(&root.join("src/skip.tmp"), b"skip me");
+        write(&root.join("node_modules/pkg/index.js"), b"skip me too");
 
         let config = ScanConfig {
-            root_path: test_dir,
+            root_path: root,
             min_size: 1,
             max_size: None,
-            save_state: false,
-            exclude_patterns: vec!["*.tmp".to_string()],
+            exclude_patterns: vec!["*.tmp".to_string(), "node_modules".to_string()],
             batch_size: 1000,
         };
 
-        let mut scanner = Scanner::new(config);
-        let _result = scanner.scan(|_, _| {}).unwrap();
+        let scanner = Scanner::new(config);
+        let (files_rx, progress_rx) = scanner.scan_streaming();
+        let files: Vec<FileInfo> = files_rx.iter().flatten().collect();
+        let last = progress_rx.iter().last().unwrap();
 
-        // Should have scanned 2 files (excluded the .tmp file)
-        assert_eq!(scanner.scanned_count(), 2);
+        assert_eq!(files.len(), 1);
+        assert!(files[0].path.ends_with("keep.txt"));
+        assert_eq!(last.scanned_count, 1);
     }
 }

@@ -1,19 +1,20 @@
-use crate::backup::BackupManager;
-use crate::database::ScanDatabase;
-use crate::duplicates::{DuplicateFinder, DuplicateGroup};
-use crate::scanner::{FileInfo, ScanConfig, ScanProgress, Scanner};
-use crate::state::{get_default_state_file, ScanState};
-use crate::suggestions::SuggestionEngine;
-use anyhow::Result;
-use std::collections::HashMap;
-use std::path::PathBuf;
-use std::sync::mpsc::Receiver;
+//! Interactive review state shared by the TUI.
+//!
+//! `App` drives a `ScanSession`, keeps the latest duplicate groups, tracks
+//! which files the user has marked (by path, so marks survive re-sorting),
+//! and funnels every removal through `deletion::plan_deletions` and a
+//! `Deleter`, with an explicit confirmation step.
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AppState {
-    Scanning,
-    ReviewingDuplicates,
-}
+use crate::database::ScanDatabase;
+use crate::deletion::{plan_deletions, Deleter, DeletionPlan, DeletionReport};
+use crate::duplicates::DuplicateGroup;
+use crate::engine::{EngineEvent, RemovedPaths, ScanSession};
+use crate::scanner::{ScanConfig, ScanProgress};
+use crate::suggestions::{GroupAnalysis, SuggestionEngine};
+use anyhow::Result;
+use std::collections::HashSet;
+use std::path::PathBuf;
+use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ViewMode {
@@ -22,580 +23,439 @@ pub enum ViewMode {
     Help,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum StorageLocation {
-    PerDirectory(PathBuf),  // .dupscanner directory in scan root
-    InMemory,                // Fallback when write permissions fail
-    #[allow(dead_code)]
-    Global(PathBuf),         // Global directory (legacy, reserved for future use)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Scope {
+    CurrentGroup,
+    AllGroups,
+}
+
+#[derive(Debug, Clone)]
+pub struct PendingConfirm {
+    pub plan: DeletionPlan,
+    pub scope: Scope,
 }
 
 pub struct App {
-    pub config: ScanConfig,
-    pub scanner: Option<Scanner>,
-    pub finder: DuplicateFinder,
-    pub backup_manager: BackupManager,
-    pub database: Option<ScanDatabase>,
-    pub scan_id: Option<i64>,
-    pub state: AppState,
-    pub current_group_index: usize,
-    pub scanned_count: usize,
-    pub total_size: u64,
-    pub paused: bool,
+    pub root_path: PathBuf,
+    pub config: Option<ScanConfig>,
+    session: Option<ScanSession>,
+    removed: Option<RemovedPaths>,
+
+    pub groups: Vec<DuplicateGroup>,
+    pub progress: ScanProgress,
     pub scan_complete: bool,
+    pub elapsed: Option<Duration>,
+    scan_started: Instant,
+
+    pub current_group_index: usize,
     pub selected_file_index: usize,
-    pub marked_for_deletion: Vec<bool>,
-    pub marked_for_deletion_all_groups: HashMap<usize, Vec<bool>>, // Store markings across all groups
-    pub show_help: bool,
-    pub status_message: Option<String>,
+    pub marked: HashSet<PathBuf>,
+
+    pub deleter: Deleter,
+    database: Option<ScanDatabase>,
+    pub scan_id: Option<i64>,
+
     pub view_mode: ViewMode,
-    // Streaming mode
-    pub file_receiver: Option<Receiver<Vec<FileInfo>>>,
-    pub progress_receiver: Option<Receiver<ScanProgress>>,
-    pub streaming_mode: bool,
-    // Storage location
-    pub storage_location: StorageLocation,
-}
-
-fn get_dupscanner_dir(scan_root: &std::path::Path) -> Option<PathBuf> {
-    let dupscanner_dir = scan_root.join(".dupscanner");
-
-    // Try to create the directory
-    if std::fs::create_dir_all(&dupscanner_dir).is_ok() {
-        // Verify we can write to it
-        let test_file = dupscanner_dir.join(".write_test");
-        if std::fs::write(&test_file, b"test").is_ok() {
-            let _ = std::fs::remove_file(&test_file);
-            return Some(dupscanner_dir);
-        }
-    }
-
-    None
+    pub status_message: Option<String>,
+    pub pending_confirm: Option<PendingConfirm>,
+    pub total_deleted: usize,
+    pub total_freed: u64,
+    pub last_report: Option<DeletionReport>,
 }
 
 impl App {
-    pub fn new(config: ScanConfig) -> Self {
-        let scanner = Some(Scanner::new(config.clone()));
-
-        // Try to get per-directory .dupscanner location
-        let dupscanner_dir = get_dupscanner_dir(&config.root_path);
-
-        let (backup_manager, database, scan_id, storage_location) = if let Some(ref dir) = dupscanner_dir {
-            // Per-directory storage
-            let mut backup_manager = BackupManager::new_with_dir(dir.clone()).unwrap_or_default();
-            let _ = backup_manager.load_records();
-
-            let db_path = dir.join("scans.db");
-            let database = ScanDatabase::open_or_in_memory(&db_path);
-            let scan_id = database.start_scan(&config.root_path).ok();
-
-            let storage_location = if database.is_in_memory() {
-                StorageLocation::InMemory
-            } else {
-                StorageLocation::PerDirectory(dir.clone())
-            };
-
-            (backup_manager, Some(database), scan_id, storage_location)
-        } else {
-            // Fallback to in-memory only (no backup support without write permissions)
-            let backup_manager = BackupManager::new().unwrap_or_default();
-            let database = ScanDatabase::open_in_memory().ok();
-            let scan_id = database.as_ref().and_then(|db| db.start_scan(&config.root_path).ok());
-
-            (backup_manager, database, scan_id, StorageLocation::InMemory)
-        };
-
+    /// Start a fresh scan.
+    pub fn new_scan(config: ScanConfig, deleter: Deleter, database: Option<ScanDatabase>) -> Self {
+        let session = ScanSession::start(config.clone());
+        let removed = session.removed_paths();
         App {
-            config,
-            scanner,
-            finder: DuplicateFinder::new(),
-            backup_manager,
+            root_path: config.root_path.clone(),
+            config: Some(config),
+            session: Some(session),
+            removed: Some(removed),
+            groups: Vec::new(),
+            progress: ScanProgress::default(),
+            scan_complete: false,
+            elapsed: None,
+            scan_started: Instant::now(),
+            current_group_index: 0,
+            selected_file_index: 0,
+            marked: HashSet::new(),
+            deleter,
+            database,
+            scan_id: None,
+            view_mode: ViewMode::Duplicates,
+            status_message: None,
+            pending_confirm: None,
+            total_deleted: 0,
+            total_freed: 0,
+            last_report: None,
+        }
+    }
+
+    /// Review a previously recorded scan.
+    pub fn from_recorded(
+        root_path: PathBuf,
+        groups: Vec<DuplicateGroup>,
+        files_scanned: usize,
+        deleter: Deleter,
+        database: Option<ScanDatabase>,
+        scan_id: Option<i64>,
+    ) -> Self {
+        let mut groups = groups;
+        groups.retain(|g| !g.is_empty());
+        groups.sort_by(|a, b| b.wasted_space.cmp(&a.wasted_space));
+        App {
+            root_path,
+            config: None,
+            session: None,
+            removed: None,
+            groups,
+            progress: ScanProgress {
+                scanned_count: files_scanned,
+                ..ScanProgress::default()
+            },
+            scan_complete: true,
+            elapsed: None,
+            scan_started: Instant::now(),
+            current_group_index: 0,
+            selected_file_index: 0,
+            marked: HashSet::new(),
+            deleter,
             database,
             scan_id,
-            state: AppState::Scanning,
-            current_group_index: 0,
-            scanned_count: 0,
-            total_size: 0,
-            paused: false,
-            scan_complete: false,
-            selected_file_index: 0,
-            marked_for_deletion: Vec::new(),
-            marked_for_deletion_all_groups: HashMap::new(),
-            show_help: false,
-            status_message: None,
             view_mode: ViewMode::Duplicates,
-            file_receiver: None,
-            progress_receiver: None,
-            streaming_mode: false,
-            storage_location,
+            status_message: None,
+            pending_confirm: None,
+            total_deleted: 0,
+            total_freed: 0,
+            last_report: None,
         }
     }
 
-    pub fn from_state_file(state_file: PathBuf) -> Result<Self> {
-        let scan_state = ScanState::load(&state_file)?;
-
-        let mut app = App::new(scan_state.config.clone());
-        app.scanned_count = scan_state.scanned_count;
-        app.total_size = scan_state.total_size;
-
-        if scan_state.completed {
-            // Restore duplicate groups
-            for group in scan_state.duplicate_groups {
-                app.finder.groups_mut().push(group);
-            }
-            app.state = AppState::ReviewingDuplicates;
-            app.scan_complete = true;
-        } else {
-            // Resume scanning - we'll need to re-scan
-            app.state = AppState::Scanning;
-        }
-
-        Ok(app)
+    pub fn is_scanning(&self) -> bool {
+        !self.scan_complete
     }
 
-    pub fn save_state(&self) -> Result<()> {
-        // Save to JSON state file if requested
-        if self.config.save_state {
-            let state_file = get_default_state_file(&self.config.root_path)?;
+    pub fn scan_elapsed(&self) -> Duration {
+        self.elapsed.unwrap_or_else(|| self.scan_started.elapsed())
+    }
 
-            let mut scan_state = ScanState::new(self.config.clone());
-            scan_state.scanned_count = self.scanned_count;
-            scan_state.total_size = self.total_size;
-            scan_state.completed = self.scan_complete;
-            scan_state.update_from_finder(&self.finder);
-
-            scan_state.save(&state_file)?;
-        }
-
-        // Save to database if scan is complete
-        if self.scan_complete {
-            if let (Some(ref db), Some(scan_id)) = (&self.database, self.scan_id) {
-                // Save all duplicate groups
-                for group in self.finder.groups() {
-                    let _ = db.save_duplicate_group(scan_id, group);
+    /// Pull pending engine events. Cheap; call once per frame.
+    pub fn tick(&mut self) {
+        let events: Vec<EngineEvent> = {
+            let Some(session) = &self.session else { return };
+            let mut v = Vec::new();
+            while let Some(ev) = session.try_next() {
+                let done = matches!(ev, EngineEvent::Complete { .. });
+                v.push(ev);
+                if done || v.len() >= 32 {
+                    break;
                 }
-
-                // Complete the scan
-                let _ = db.complete_scan(scan_id, self.scanned_count, self.finder.groups().len());
+            }
+            v
+        };
+        for ev in events {
+            match ev {
+                EngineEvent::Progress(p) => self.progress = p,
+                EngineEvent::Groups(groups) => {
+                    self.groups = groups;
+                    self.clamp_selection();
+                }
+                EngineEvent::Complete {
+                    finder,
+                    progress,
+                    elapsed,
+                } => {
+                    self.groups = finder.groups().to_vec();
+                    self.progress = progress;
+                    self.elapsed = Some(elapsed);
+                    self.scan_complete = true;
+                    self.clamp_selection();
+                    self.record_completed_scan();
+                    self.session = None;
+                    return;
+                }
             }
         }
-
-        Ok(())
     }
+
+    fn record_completed_scan(&mut self) {
+        if let Some(db) = &mut self.database {
+            match db.record_completed_scan(&self.root_path, self.progress.scanned_count, &self.groups) {
+                Ok(id) => self.scan_id = Some(id),
+                Err(e) => self.status_message = Some(format!("Could not save scan to database: {e}")),
+            }
+        }
+    }
+
+    fn persist_groups(&mut self) {
+        if let (Some(db), Some(id)) = (&mut self.database, self.scan_id) {
+            let _ = db.save_groups(id, &self.groups);
+            let _ = db.complete_scan(id, self.progress.scanned_count, self.groups.len());
+        }
+    }
+
+    pub fn db_path(&self) -> Option<&std::path::Path> {
+        self.database.as_ref().and_then(|d| d.db_path())
+    }
+
+    // ----- navigation -------------------------------------------------
 
     pub fn current_group(&self) -> Option<&DuplicateGroup> {
-        self.finder.groups().get(self.current_group_index)
+        self.groups.get(self.current_group_index)
     }
 
-    pub fn current_group_mut(&mut self) -> Option<&mut DuplicateGroup> {
-        self.finder.groups_mut().get_mut(self.current_group_index)
+    pub fn current_analysis(&self) -> Option<GroupAnalysis> {
+        self.current_group().map(|g| SuggestionEngine::analyze(&g.files))
+    }
+
+    fn clamp_selection(&mut self) {
+        if self.groups.is_empty() {
+            self.current_group_index = 0;
+            self.selected_file_index = 0;
+            return;
+        }
+        if self.current_group_index >= self.groups.len() {
+            self.current_group_index = self.groups.len() - 1;
+        }
+        let n = self.groups[self.current_group_index].files.len();
+        if self.selected_file_index >= n {
+            self.selected_file_index = n.saturating_sub(1);
+        }
     }
 
     pub fn next_group(&mut self) {
-        if self.current_group_index < self.finder.groups().len().saturating_sub(1) {
-            // Save current group's marking state
-            self.save_current_group_markings();
-
+        if self.current_group_index + 1 < self.groups.len() {
             self.current_group_index += 1;
             self.selected_file_index = 0;
-            self.update_marked_for_deletion();
         }
     }
 
     pub fn previous_group(&mut self) {
         if self.current_group_index > 0 {
-            // Save current group's marking state
-            self.save_current_group_markings();
-
             self.current_group_index -= 1;
             self.selected_file_index = 0;
-            self.update_marked_for_deletion();
         }
     }
 
-    fn save_current_group_markings(&mut self) {
-        // Save the current group's markings to the HashMap
-        if !self.marked_for_deletion.is_empty() {
-            self.marked_for_deletion_all_groups.insert(
-                self.current_group_index,
-                self.marked_for_deletion.clone()
-            );
-        }
+    pub fn first_group(&mut self) {
+        self.current_group_index = 0;
+        self.selected_file_index = 0;
+    }
+
+    pub fn last_group(&mut self) {
+        self.current_group_index = self.groups.len().saturating_sub(1);
+        self.selected_file_index = 0;
     }
 
     pub fn select_next_file(&mut self) {
         if let Some(group) = self.current_group() {
-            if self.selected_file_index < group.files.len().saturating_sub(1) {
+            if self.selected_file_index + 1 < group.files.len() {
                 self.selected_file_index += 1;
             }
         }
     }
 
     pub fn select_previous_file(&mut self) {
-        if self.selected_file_index > 0 {
-            self.selected_file_index -= 1;
+        self.selected_file_index = self.selected_file_index.saturating_sub(1);
+    }
+
+    // ----- marking ----------------------------------------------------
+
+    pub fn is_marked(&self, path: &std::path::Path) -> bool {
+        self.marked.contains(path)
+    }
+
+    pub fn toggle_mark(&mut self) {
+        let Some(group) = self.current_group() else { return };
+        let Some(file) = group.files.get(self.selected_file_index) else { return };
+        let path = file.path.clone();
+        if !self.marked.remove(&path) {
+            self.marked.insert(path);
         }
     }
 
-    pub fn toggle_mark_for_deletion(&mut self) {
-        if self.selected_file_index < self.marked_for_deletion.len() {
-            self.marked_for_deletion[self.selected_file_index] =
-                !self.marked_for_deletion[self.selected_file_index];
+    fn scope_indices(&self, scope: Scope) -> Vec<usize> {
+        match scope {
+            Scope::CurrentGroup => self.current_group().map(|_| vec![self.current_group_index]).unwrap_or_default(),
+            Scope::AllGroups => (0..self.groups.len()).collect(),
         }
     }
 
-    pub fn mark_all_suggested(&mut self) {
-        if let Some(group) = self.current_group() {
-            let suggestions = SuggestionEngine::suggest_deletions(&group.files);
-
-            // Get the best file to keep
-            let keeper_index = SuggestionEngine::get_best_keeper(&group.files);
-
-            // Get keeper name for status message
-            let keeper_name = keeper_index
-                .and_then(|i| group.files.get(i))
-                .and_then(|f| f.path.file_name())
-                .and_then(|n| n.to_str())
-                .unwrap_or("?")
-                .to_string();
-
-            let file_count = group.files.len();
-
-            self.marked_for_deletion = vec![false; file_count];
-
-            let mut marked_count = 0;
-            for suggestion in &suggestions {
-                // Mark for deletion, but never mark the keeper
-                if suggestion.file_index < self.marked_for_deletion.len() {
-                    if Some(suggestion.file_index) != keeper_index {
-                        self.marked_for_deletion[suggestion.file_index] = true;
-                        marked_count += 1;
+    /// Mark files the heuristics flag as copies (never the keeper).
+    pub fn mark_suggested(&mut self, scope: Scope) {
+        let mut marked = 0usize;
+        let mut groups_touched = 0usize;
+        for gi in self.scope_indices(scope) {
+            let group = &self.groups[gi];
+            let analysis = SuggestionEngine::analyze(&group.files);
+            let mut any = false;
+            for s in analysis.suggested_deletions() {
+                if let Some(f) = group.files.get(s.file_index) {
+                    if self.marked.insert(f.path.clone()) {
+                        marked += 1;
                     }
+                    any = true;
                 }
             }
-
-            // Save markings to HashMap so they persist
-            if marked_count > 0 {
-                self.marked_for_deletion_all_groups.insert(
-                    self.current_group_index,
-                    self.marked_for_deletion.clone()
-                );
+            if any {
+                groups_touched += 1;
             }
-
-            // Set status message with details
-            if marked_count > 0 {
-                // Find the highest score to show confidence
-                let max_score = suggestions.iter().map(|s| s.score).max().unwrap_or(0);
-                let confidence = if max_score >= 100 {
-                    "high confidence"
-                } else if max_score >= 80 {
-                    "good confidence"
-                } else if max_score >= 60 {
-                    "medium confidence"
+        }
+        self.status_message = Some(match scope {
+            Scope::CurrentGroup => {
+                if marked == 0 {
+                    "No file in this group looks like a copy. Use 'o' to mark all but the keeper, or Space.".to_string()
                 } else {
-                    "low confidence - review carefully!"
-                };
-
-                self.set_status_message(format!(
-                    "Auto-marked {} of {} file(s) ({}, score: {}) - keeping: {}",
-                    marked_count,
-                    file_count,
-                    confidence,
-                    max_score,
-                    keeper_name
-                ));
-            } else {
-                // Explain WHY there are no suggestions
-                let reasons = if file_count < 2 {
-                    "Only one file in group"
-                } else {
-                    "All files look equally good (use 'o' to mark all except oldest, or Space to mark manually)"
-                };
-                self.set_status_message(format!("No auto-suggestions - {}", reasons));
-            }
-        }
-    }
-
-    pub fn mark_all_suggested_all_groups(&mut self) {
-        // Mark all suggested files across ALL groups
-        let mut total_marked = 0;
-
-        // Process each group
-        let num_groups = self.finder.groups().len();
-        for group_idx in 0..num_groups {
-            if let Some(group) = self.finder.groups().get(group_idx) {
-                let suggestions = SuggestionEngine::suggest_deletions(&group.files);
-                let keeper_index = SuggestionEngine::get_best_keeper(&group.files);
-
-                // Create marking vector for this group
-                let mut markings = vec![false; group.files.len()];
-
-                for suggestion in suggestions {
-                    // Mark suggested files, but never mark the keeper
-                    if Some(suggestion.file_index) != keeper_index && suggestion.file_index < markings.len() {
-                        markings[suggestion.file_index] = true;
-                        total_marked += 1;
-                    }
-                }
-
-                // Store the markings for this group
-                self.marked_for_deletion_all_groups.insert(group_idx, markings);
-            }
-        }
-
-        // Update the current group's display to show the markings
-        self.update_marked_for_deletion();
-
-        // Set status message
-        self.set_status_message(format!(
-            "Auto-marked {} suggested file(s) across {} group(s)",
-            total_marked,
-            num_groups
-        ));
-    }
-
-    pub fn mark_all_except_oldest(&mut self) {
-        if let Some(group) = self.current_group() {
-            if let Some(keeper_index) = SuggestionEngine::get_best_keeper(&group.files) {
-                // Get keeper name before modifying state
-                let keeper_name = group.files.get(keeper_index)
-                    .and_then(|f| f.path.file_name())
-                    .and_then(|n| n.to_str())
-                    .unwrap_or("?")
-                    .to_string();
-
-                let file_count = group.files.len();
-
-                self.marked_for_deletion = vec![true; file_count];
-                if keeper_index < self.marked_for_deletion.len() {
-                    self.marked_for_deletion[keeper_index] = false;
-                }
-
-                // Save markings to HashMap so they persist
-                self.marked_for_deletion_all_groups.insert(
-                    self.current_group_index,
-                    self.marked_for_deletion.clone()
-                );
-
-                // Set status message
-                self.set_status_message(format!(
-                    "Marked all except oldest - keeping: {}",
-                    keeper_name
-                ));
-            }
-        }
-    }
-
-    pub fn mark_all_except_oldest_all_groups(&mut self) {
-        // Mark all except oldest across ALL groups
-        let mut total_marked = 0;
-
-        // Process each group
-        let num_groups = self.finder.groups().len();
-        for group_idx in 0..num_groups {
-            if let Some(group) = self.finder.groups().get(group_idx) {
-                if let Some(keeper_index) = SuggestionEngine::get_best_keeper(&group.files) {
-                    // Create marking vector for this group
-                    let mut markings = vec![true; group.files.len()];
-                    if keeper_index < markings.len() {
-                        markings[keeper_index] = false;
-                    }
-
-                    // Count marked files (all except the keeper)
-                    total_marked += markings.iter().filter(|&&m| m).count();
-
-                    // Store the markings for this group
-                    self.marked_for_deletion_all_groups.insert(group_idx, markings);
+                    let conf = self.current_analysis().map(|a| a.confidence()).unwrap_or("");
+                    format!("Marked {marked} suggested file(s) ({conf})")
                 }
             }
-        }
-
-        // Update the current group's display to show the markings
-        self.update_marked_for_deletion();
-
-        // Set status message
-        self.set_status_message(format!(
-            "Marked all except oldest across {} group(s) - {} file(s) marked",
-            num_groups,
-            total_marked
-        ));
+            Scope::AllGroups => format!("Marked {marked} suggested file(s) in {groups_touched} group(s)"),
+        });
     }
 
-    pub fn delete_marked_files(&mut self) -> Result<usize> {
-        // Save current group's markings before we start deleting
-        self.save_current_group_markings();
-
-        let mut deleted_count = 0;
-        let mut failed_count = 0;
-
-        if let Some(group) = self.current_group() {
-            let mut files_to_delete = Vec::new();
-
-            for (i, &marked) in self.marked_for_deletion.iter().enumerate() {
-                if marked && i < group.files.len() {
-                    files_to_delete.push(group.files[i].clone());
-                }
-            }
-
-            // Track which files were successfully deleted
-            let mut successfully_deleted = Vec::new();
-
-            // Delete files
-            for file_info in files_to_delete.iter() {
-                match self.backup_manager.delete_with_backup(&file_info.path) {
-                    Ok(_) => {
-                        deleted_count += 1;
-                        successfully_deleted.push(file_info.path.clone());
-                    }
-                    Err(e) => {
-                        failed_count += 1;
-                        eprintln!("Error deleting {}: {}", file_info.path.display(), e);
+    /// Mark every file except the keeper.
+    pub fn mark_all_but_keeper(&mut self, scope: Scope) {
+        let mut marked = 0usize;
+        for gi in self.scope_indices(scope) {
+            let group = &self.groups[gi];
+            let analysis = SuggestionEngine::analyze(&group.files);
+            for s in analysis.all_but_keeper() {
+                if let Some(f) = group.files.get(s.file_index) {
+                    if self.marked.insert(f.path.clone()) {
+                        marked += 1;
                     }
                 }
             }
-
-            // Remove ONLY successfully deleted files from the group
-            if let Some(group) = self.current_group_mut() {
-                group.files.retain(|f| {
-                    !successfully_deleted.iter().any(|d| d == &f.path)
-                });
-            }
-
-            // Clean up empty groups
-            self.finder.remove_empty_groups();
-
-            // Clear the marking state for this group since files were deleted
-            self.marked_for_deletion_all_groups.remove(&self.current_group_index);
-
-            // Reset selection
-            self.selected_file_index = 0;
-            self.update_marked_for_deletion();
-
-            // Save state after deletion
-            let _ = self.save_state();
-
-            // Set status message with results
-            if failed_count > 0 {
-                self.set_status_message(format!(
-                    "Deleted {} file(s), {} failed (check terminal for errors)",
-                    deleted_count,
-                    failed_count
-                ));
-            }
         }
-
-        Ok(deleted_count)
+        let keeper = self
+            .current_analysis()
+            .and_then(|a| a.keeper)
+            .and_then(|k| self.current_group().and_then(|g| g.files.get(k)))
+            .and_then(|f| f.path.file_name().map(|n| n.to_string_lossy().to_string()))
+            .unwrap_or_default();
+        self.status_message = Some(match scope {
+            Scope::CurrentGroup => format!("Marked {marked} file(s), keeping {keeper}"),
+            Scope::AllGroups => format!("Marked {marked} file(s) across all groups"),
+        });
     }
 
-    pub fn delete_marked_files_all_groups(&mut self) -> Result<usize> {
-        // Save current group's markings first
-        self.save_current_group_markings();
+    pub fn clear_marks(&mut self, scope: Scope) {
+        match scope {
+            Scope::CurrentGroup => {
+                if let Some(group) = self.current_group() {
+                    let paths: Vec<PathBuf> = group.files.iter().map(|f| f.path.clone()).collect();
+                    for p in paths {
+                        self.marked.remove(&p);
+                    }
+                }
+                self.status_message = Some("Cleared marks in this group".into());
+            }
+            Scope::AllGroups => {
+                self.marked.clear();
+                self.status_message = Some("Cleared all marks".into());
+            }
+        }
+    }
 
-        let mut total_deleted = 0;
-        let mut total_failed = 0;
+    pub fn marked_in_group(&self, group: &DuplicateGroup) -> usize {
+        group.files.iter().filter(|f| self.marked.contains(&f.path)).count()
+    }
 
-        // Process each group that has marked files
-        let num_groups = self.finder.groups().len();
-        for group_idx in 0..num_groups {
-            // Get the markings for this group (if any)
-            let markings = if group_idx == self.current_group_index {
-                self.marked_for_deletion.clone()
-            } else {
-                self.marked_for_deletion_all_groups
-                    .get(&group_idx)
-                    .cloned()
+    pub fn marked_bytes(&self) -> u64 {
+        self.groups
+            .iter()
+            .flat_map(|g| g.files.iter())
+            .filter(|f| self.marked.contains(&f.path))
+            .map(|f| f.size)
+            .sum()
+    }
+
+    // ----- deletion ---------------------------------------------------
+
+    /// Validate the marked files in `scope` and ask for confirmation.
+    pub fn request_delete(&mut self, scope: Scope) {
+        let wanted: HashSet<PathBuf> = match scope {
+            Scope::CurrentGroup => self
+                .current_group()
+                .map(|g| {
+                    g.files
+                        .iter()
+                        .filter(|f| self.marked.contains(&f.path))
+                        .map(|f| f.path.clone())
+                        .collect()
+                })
+                .unwrap_or_default(),
+            Scope::AllGroups => self.marked.clone(),
+        };
+        if wanted.is_empty() {
+            self.status_message = Some("Nothing marked. Space marks a file, 'a' marks suggested copies.".into());
+            return;
+        }
+
+        let groups: Vec<DuplicateGroup> = match scope {
+            Scope::CurrentGroup => self.current_group().cloned().into_iter().collect(),
+            Scope::AllGroups => self.groups.clone(),
+        };
+        match plan_deletions(&groups, &wanted) {
+            Ok(plan) => self.pending_confirm = Some(PendingConfirm { plan, scope }),
+            Err(e) => self.status_message = Some(format!("Not deleting: {e}")),
+        }
+    }
+
+    pub fn cancel_delete(&mut self) {
+        self.pending_confirm = None;
+        self.status_message = Some("Deletion cancelled".into());
+    }
+
+    pub fn confirm_delete(&mut self) -> Result<()> {
+        let Some(pending) = self.pending_confirm.take() else { return Ok(()) };
+        let report = self.deleter.delete_planned(&pending.plan);
+        let deleted = report.deleted_paths();
+
+        for group in &mut self.groups {
+            group.remove_paths(&deleted);
+        }
+        self.groups.retain(|g| !g.is_empty());
+        for p in &deleted {
+            self.marked.remove(p);
+        }
+        if let Some(removed) = &self.removed {
+            removed.add_all(deleted.iter().cloned());
+        }
+        self.clamp_selection();
+
+        self.total_deleted += report.deleted_count();
+        self.total_freed += report.bytes_freed();
+        let method = self.deleter.method().label();
+        self.status_message = Some(if report.failed_count() > 0 {
+            format!(
+                "Deleted {} file(s) via {method}, {} failed: {}",
+                report.deleted_count(),
+                report.failed_count(),
+                report
+                    .failures()
+                    .next()
+                    .map(|(_, e)| e.to_string())
                     .unwrap_or_default()
-            };
-
-            if markings.is_empty() || !markings.iter().any(|&m| m) {
-                continue; // Skip groups with no markings
-            }
-
-            if let Some(group) = self.finder.groups().get(group_idx).cloned() {
-                let mut files_to_delete = Vec::new();
-
-                for (i, &marked) in markings.iter().enumerate() {
-                    if marked && i < group.files.len() {
-                        files_to_delete.push(group.files[i].clone());
-                    }
-                }
-
-                // Track which files were successfully deleted
-                let mut successfully_deleted = Vec::new();
-
-                // Delete files
-                for file_info in files_to_delete.iter() {
-                    match self.backup_manager.delete_with_backup(&file_info.path) {
-                        Ok(_) => {
-                            total_deleted += 1;
-                            successfully_deleted.push(file_info.path.clone());
-                        }
-                        Err(e) => {
-                            total_failed += 1;
-                            eprintln!("Error deleting {}: {}", file_info.path.display(), e);
-                        }
-                    }
-                }
-
-                // Remove ONLY successfully deleted files from the group
-                if let Some(group) = self.finder.groups_mut().get_mut(group_idx) {
-                    group.files.retain(|f| {
-                        !successfully_deleted.iter().any(|d| d == &f.path)
-                    });
-                }
-            }
-        }
-
-        // Clean up empty groups
-        self.finder.remove_empty_groups();
-
-        // Clear all marking state
-        self.marked_for_deletion_all_groups.clear();
-
-        // Reset to first group and clear markings
-        self.current_group_index = 0;
-        self.selected_file_index = 0;
-        self.update_marked_for_deletion();
-
-        // Save state after deletion
-        let _ = self.save_state();
-
-        // Set status message with results
-        if total_failed > 0 {
-            self.set_status_message(format!(
-                "Deleted {} file(s) across all groups, {} failed (check terminal for errors)",
-                total_deleted,
-                total_failed
-            ));
-        }
-
-        Ok(total_deleted)
-    }
-
-    pub fn update_marked_for_deletion(&mut self) {
-        if let Some(group) = self.current_group() {
-            // Check if we have saved markings for this group
-            if let Some(saved_markings) = self.marked_for_deletion_all_groups.get(&self.current_group_index) {
-                self.marked_for_deletion = saved_markings.clone();
-            } else {
-                self.marked_for_deletion = vec![false; group.files.len()];
-            }
+            )
         } else {
-            self.marked_for_deletion.clear();
+            format!(
+                "Deleted {} file(s) via {method}, freed {}",
+                report.deleted_count(),
+                humansize::format_size(report.bytes_freed(), humansize::BINARY)
+            )
+        });
+        self.last_report = Some(report);
+        if self.scan_complete {
+            self.persist_groups();
         }
+        Ok(())
     }
 
-    pub fn toggle_help(&mut self) {
-        self.show_help = !self.show_help;
-    }
-
-    pub fn set_status_message(&mut self, message: String) {
-        self.status_message = Some(message);
-    }
-
-    pub fn clear_status_message(&mut self) {
-        self.status_message = None;
-    }
+    // ----- misc -------------------------------------------------------
 
     pub fn cycle_view(&mut self) {
         self.view_mode = match self.view_mode {
@@ -605,73 +465,15 @@ impl App {
         };
     }
 
-    /// Start streaming scan - files will be processed incrementally as they're found
-    pub fn start_streaming_scan(&mut self) {
-        if let Some(scanner) = &self.scanner {
-            let (file_rx, progress_rx) = scanner.scan_streaming();
-            self.file_receiver = Some(file_rx);
-            self.progress_receiver = Some(progress_rx);
-            self.streaming_mode = true;
-            self.state = AppState::ReviewingDuplicates; // Allow immediate interaction
-        }
+    pub fn total_wasted(&self) -> u64 {
+        self.groups.iter().map(|g| g.wasted_space).sum()
     }
 
-    /// Process incoming files from the stream - returns true if scan is still active
-    pub fn process_incoming_files(&mut self) -> bool {
-        let mut scan_active = true;
-        let mut files_processed = false;
+    pub fn total_duplicate_files(&self) -> usize {
+        self.groups.iter().map(|g| g.file_count()).sum()
+    }
 
-        // Process all available batches (non-blocking)
-        if let Some(ref file_rx) = self.file_receiver {
-            loop {
-                match file_rx.try_recv() {
-                    Ok(batch) => {
-                        // Process all files in this batch
-                        for file in batch {
-                            let _ = self.finder.process_file(file);
-                        }
-                        files_processed = true;
-                    }
-                    Err(std::sync::mpsc::TryRecvError::Empty) => {
-                        break; // No more batches available right now
-                    }
-                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                        scan_active = false;
-                        self.scan_complete = true;
-                        break; // Scanner finished
-                    }
-                }
-            }
-        }
-
-        // Update markings after processing files (outside the borrow)
-        // Sort groups periodically for display (but not on every file)
-        if files_processed {
-            // Sort every 100 files or when scan completes
-            if self.scanned_count % 100 == 0 || !scan_active {
-                self.finder.ensure_sorted();
-            }
-            self.update_marked_for_deletion();
-        }
-
-        // Process progress updates
-        if let Some(ref progress_rx) = self.progress_receiver {
-            loop {
-                match progress_rx.try_recv() {
-                    Ok(progress) => {
-                        self.scanned_count = progress.scanned_count;
-                        self.total_size = progress.total_size;
-                    }
-                    Err(std::sync::mpsc::TryRecvError::Empty) => {
-                        break;
-                    }
-                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                        break;
-                    }
-                }
-            }
-        }
-
-        scan_active
+    pub fn clear_status(&mut self) {
+        self.status_message = None;
     }
 }
