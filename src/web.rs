@@ -13,6 +13,9 @@
 use crate::backup::BackupManager;
 use crate::database::ScanDatabase;
 use crate::deletion::{plan_deletions, DeleteMethod, Deleter};
+use crate::edits::{self, RenameError, ScanEdits};
+use crate::filters::{FileKind, GroupFilter, SizeBucket};
+use crate::selection::{self, SelectMode};
 use crate::duplicates::DuplicateGroup;
 use crate::engine::{EngineEvent, RemovedPaths, ScanSession};
 use crate::report::{self, GroupReport};
@@ -31,7 +34,7 @@ use futures_util::stream::{Stream, StreamExt};
 use percent_encoding::{utf8_percent_encode, NON_ALPHANUMERIC};
 use serde::Deserialize;
 use serde_json::{json, Value};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::convert::Infallible;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -84,12 +87,13 @@ pub(crate) struct State {
     deleter: Deleter,
     /// Handle to the running engine, if any.
     removed: Option<RemovedPaths>,
-    /// Paths deleted through the UI while the engine was still running.
-    /// Snapshots from the engine are filtered against this set.
-    deleted_during_scan: HashSet<PathBuf>,
-    /// Renames performed while the engine was still running, applied to
-    /// every snapshot the engine sends afterwards.
-    renamed_during_scan: HashMap<PathBuf, PathBuf>,
+    /// Deletions and renames made while the engine was still running,
+    /// replayed onto every later snapshot.
+    edits: ScanEdits,
+    /// Scan settings (None when serving a recorded scan).
+    config: Option<ScanConfig>,
+    deleted_this_run: usize,
+    bytes_freed_this_run: u64,
     database: Option<ScanDatabase>,
     scan_id: Option<i64>,
     /// Bumped on every change to `groups`.
@@ -129,6 +133,17 @@ impl State {
             "delete_method_description": self.deleter.method().description(),
             "scan_id": self.scan_id,
             "version": self.version,
+            "db_path": self.database.as_ref().and_then(|d| d.db_path()).map(|p| p.display().to_string()),
+            "deleted_this_run": self.deleted_this_run,
+            "bytes_freed_this_run": self.bytes_freed_this_run,
+            "settings": self.config.as_ref().map(|c| json!({
+                "min_size": c.min_size,
+                "max_size": c.max_size,
+                "exclusions": c.exclude_patterns,
+            })),
+            "select_modes": SelectMode::ALL.iter().map(|m| json!({
+                "key": m.key(), "label": m.label(), "shortcut": m.shortcut().to_string(),
+            })).collect::<Vec<_>>(),
         })
     }
 
@@ -143,23 +158,14 @@ impl State {
 
     /// Apply UI-side edits made during the scan to a snapshot from the engine.
     fn adopt_snapshot(&mut self, mut groups: Vec<DuplicateGroup>) {
-        if !self.deleted_during_scan.is_empty() {
-            for g in &mut groups {
-                g.remove_paths(&self.deleted_during_scan);
-            }
-        }
-        if !self.renamed_during_scan.is_empty() {
-            for g in &mut groups {
-                for f in &mut g.files {
-                    if let Some(new) = self.renamed_during_scan.get(&f.path) {
-                        f.path = new.clone();
-                    }
-                }
-            }
-        }
-        groups.retain(|g| !g.is_empty());
+        self.edits.apply(&mut groups);
         self.groups = groups;
         self.version += 1;
+    }
+
+    /// Indices of the groups passing `filter`, in display order.
+    fn filtered_indices(&self, filter: &GroupFilter) -> Vec<usize> {
+        filter.apply(&self.groups)
     }
 
     fn persist_groups(&mut self) {
@@ -254,33 +260,6 @@ pub(crate) fn validate_path(state: &State, requested: &Path) -> Result<PathBuf, 
     Ok(canonical)
 }
 
-/// A new file name must be exactly one normal path component.
-pub(crate) fn validate_new_name(name: &str) -> Result<(), String> {
-    if name.is_empty() {
-        return Err("New name must not be empty".into());
-    }
-    if name != name.trim() {
-        return Err("New name must not start or end with whitespace".into());
-    }
-    if name.contains('\0') {
-        return Err("New name must not contain NUL".into());
-    }
-    if name.contains('/') || name.contains('\\') {
-        return Err("New name must not contain path separators".into());
-    }
-    if name == "." || name == ".." {
-        return Err("New name must be a file name, not . or ..".into());
-    }
-    if name.len() > 255 {
-        return Err("New name is too long (255 bytes max)".into());
-    }
-    let mut components = Path::new(name).components();
-    match (components.next(), components.next()) {
-        (Some(std::path::Component::Normal(_)), None) => Ok(()),
-        _ => Err("New name must be a single file name".into()),
-    }
-}
-
 /// Map a requested path onto the exact path stored in the groups, accepting
 /// either the stored form or any spelling that canonicalizes to it. Paths
 /// that match nothing are returned unchanged so `plan_deletions` can reject
@@ -298,47 +277,7 @@ fn resolve_known_path(state: &State, requested: &Path) -> PathBuf {
 }
 
 // ---------------------------------------------------------------------------
-// Filtering
-
-fn extension_lower(path: &Path) -> String {
-    path.extension()
-        .map(|e| e.to_string_lossy().to_ascii_lowercase())
-        .unwrap_or_default()
-}
-
-fn file_type(path: &Path) -> &'static str {
-    match extension_lower(path).as_str() {
-        "jpg" | "jpeg" | "png" | "gif" | "bmp" | "webp" | "heic" | "heif" | "tif" | "tiff" | "svg" | "ico"
-        | "avif" | "raw" | "cr2" | "nef" | "arw" | "dng" | "psd" => "image",
-        "mp4" | "mov" | "avi" | "mkv" | "webm" | "wmv" | "flv" | "m4v" | "mpg" | "mpeg" | "3gp" | "ts" => "video",
-        "mp3" | "wav" | "flac" | "ogg" | "oga" | "m4a" | "aac" | "aiff" | "aif" | "wma" | "opus" | "mid"
-        | "midi" => "audio",
-        "pdf" | "doc" | "docx" | "txt" | "md" | "rtf" | "odt" | "xls" | "xlsx" | "ods" | "ppt" | "pptx" | "odp"
-        | "csv" | "pages" | "numbers" | "key" | "epub" | "mobi" => "document",
-        "zip" | "tar" | "gz" | "tgz" | "bz2" | "xz" | "zst" | "7z" | "rar" | "dmg" | "iso" | "jar" | "war" => {
-            "archive"
-        }
-        "rs" | "js" | "mjs" | "cjs" | "jsx" | "tsx" | "py" | "rb" | "go" | "java" | "c" | "h" | "cpp" | "hpp"
-        | "cc" | "cs" | "swift" | "kt" | "kts" | "php" | "html" | "htm" | "css" | "scss" | "less" | "json"
-        | "yaml" | "yml" | "toml" | "xml" | "sh" | "bash" | "zsh" | "sql" | "lua" | "pl" | "r" | "m" | "vue"
-        | "svelte" | "ipynb" | "lock" => "code",
-        _ => "other",
-    }
-}
-
-fn size_bucket(size: u64) -> &'static str {
-    const KB: u64 = 1024;
-    const MB: u64 = 1024 * KB;
-    if size < 10 * KB {
-        "tiny"
-    } else if size < MB {
-        "small"
-    } else if size < 100 * MB {
-        "medium"
-    } else {
-        "large"
-    }
-}
+// Filtering (shared with the TUI through `filters::GroupFilter`)
 
 #[derive(Debug, Default, Deserialize)]
 struct GroupsQuery {
@@ -350,16 +289,26 @@ struct GroupsQuery {
     kind: Option<String>,
 }
 
-fn group_matches(group: &DuplicateGroup, path_filter: &str, size: &str, kind: &str) -> bool {
-    if size != "all" && size_bucket(group.file_size()) != size {
-        return false;
+impl GroupsQuery {
+    fn filter(&self) -> Result<GroupFilter, ApiError> {
+        let size = match &self.size {
+            Some(s) => SizeBucket::parse(s).ok_or_else(|| bad_request(format!("unknown size filter: {s}")))?,
+            None => SizeBucket::All,
+        };
+        let kind = match &self.kind {
+            Some(k) => FileKind::parse(k).ok_or_else(|| bad_request(format!("unknown type filter: {k}")))?,
+            None => FileKind::All,
+        };
+        Ok(GroupFilter {
+            path: self.path.clone().unwrap_or_default(),
+            size,
+            kind,
+        })
     }
-    let path_filter = path_filter.trim().to_lowercase();
-    group.files.iter().any(|f| {
-        let path_ok = path_filter.is_empty() || f.path.to_string_lossy().to_lowercase().contains(&path_filter);
-        let type_ok = kind == "all" || file_type(&f.path) == kind;
-        path_ok && type_ok
-    })
+
+    fn page(&self) -> (usize, usize) {
+        (self.offset.unwrap_or(0), self.limit.unwrap_or(DEFAULT_PAGE).clamp(1, MAX_PAGE))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -412,33 +361,75 @@ async fn api_scan(AxumState(app): AxumState<AppState>) -> Json<Value> {
     Json(app.lock().status_json())
 }
 
-async fn api_groups(AxumState(app): AxumState<AppState>, Query(q): Query<GroupsQuery>) -> Json<Value> {
-    let limit = q.limit.unwrap_or(DEFAULT_PAGE).clamp(1, MAX_PAGE);
-    let offset = q.offset.unwrap_or(0);
-    let path_filter = q.path.unwrap_or_default();
-    let size = q.size.unwrap_or_else(|| "all".into());
-    let kind = q.kind.unwrap_or_else(|| "all".into());
+async fn api_groups(
+    AxumState(app): AxumState<AppState>,
+    Query(q): Query<GroupsQuery>,
+) -> Result<Json<Value>, ApiError> {
+    let filter = q.filter()?;
+    let (offset, limit) = q.page();
 
     let state = app.lock();
-    let matching: Vec<&DuplicateGroup> = state
-        .groups
-        .iter()
-        .filter(|g| group_matches(g, &path_filter, &size, &kind))
-        .collect();
+    let matching = state.filtered_indices(&filter);
     let total = matching.len();
     let page: Vec<GroupReport> = matching
-        .into_iter()
+        .iter()
         .skip(offset)
         .take(limit)
-        .map(report::group_report)
+        .map(|&i| report::group_report(&state.groups[i]))
         .collect();
-    Json(json!({
+    Ok(Json(json!({
         "total": total,
         "offset": offset,
         "limit": limit,
         "version": state.version,
         "groups": page,
-    }))
+    })))
+}
+
+#[derive(Debug, Deserialize)]
+struct SelectRequest {
+    mode: String,
+    /// "page" (default) applies to the page described by offset/limit;
+    /// "all" applies to every group matching the filter.
+    #[serde(default)]
+    scope: Option<String>,
+    #[serde(flatten)]
+    query: GroupsQuery,
+}
+
+/// Compute, with the shared selection rules, which paths an auto-select
+/// mode would mark. The browser then marks exactly those paths.
+async fn api_select(
+    AxumState(app): AxumState<AppState>,
+    body: Result<Json<SelectRequest>, JsonRejection>,
+) -> Result<Json<Value>, ApiError> {
+    let Json(req) = body?;
+    let mode = SelectMode::parse(&req.mode).ok_or_else(|| bad_request(format!("unknown select mode: {}", req.mode)))?;
+    let filter = req.query.filter()?;
+    let (offset, limit) = req.query.page();
+    let all = matches!(req.scope.as_deref(), Some("all"));
+
+    let state = app.lock();
+    let matching = state.filtered_indices(&filter);
+    let indices: Vec<usize> = if all {
+        matching
+    } else {
+        matching.into_iter().skip(offset).take(limit).collect()
+    };
+    let groups: Vec<&DuplicateGroup> = indices.iter().map(|&i| &state.groups[i]).collect();
+    // Paths whose marks the caller should clear first: every file in the
+    // touched groups (auto-select owns those groups' marks).
+    let clear: Vec<&PathBuf> = groups.iter().flat_map(|g| g.files.iter().map(|f| &f.path)).collect();
+    let paths = selection::paths_for_mode(groups.iter().copied(), mode);
+    Ok(Json(json!({
+        "mode": mode.key(),
+        "label": mode.label(),
+        "scope": if all { "all" } else { "page" },
+        "groups": groups.len(),
+        "clear": clear,
+        "paths": paths,
+        "version": state.version,
+    })))
 }
 
 async fn api_events(
@@ -494,8 +485,10 @@ async fn api_delete(
             if let Some(removed) = &state.removed {
                 removed.add_all(deleted.iter().cloned());
             }
-            state.deleted_during_scan.extend(deleted.iter().cloned());
+            state.edits.record_deleted(deleted.iter().cloned());
         }
+        state.deleted_this_run += report.deleted_count();
+        state.bytes_freed_this_run += report.bytes_freed();
         if state.scan_id.is_some() {
             state.persist_groups();
         }
@@ -533,56 +526,27 @@ async fn api_rename(
     body: Result<Json<RenameRequest>, JsonRejection>,
 ) -> Result<Json<GroupReport>, ApiError> {
     let Json(req) = body?;
-    validate_new_name(&req.new_name).map_err(bad_request)?;
+    edits::validate_new_name(&req.new_name).map_err(bad_request)?;
 
     let app2 = app.clone();
     let report = tokio::task::spawn_blocking(move || -> Result<GroupReport, ApiError> {
         let mut state = app2.lock();
         let old = validate_path(&state, Path::new(&req.path))?;
-        let parent = old
-            .parent()
-            .ok_or_else(|| bad_request("Cannot rename a path without a parent directory"))?;
-        let new = parent.join(&req.new_name);
-        if new == old {
-            return Err(bad_request("The new name is the same as the current name"));
-        }
-        if fs::symlink_metadata(&new).is_ok() {
-            return Err(ApiError(
-                StatusCode::CONFLICT,
-                format!("{} already exists", new.display()),
-            ));
-        }
-        fs::rename(&old, &new).map_err(|e| {
-            ApiError(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Failed to rename {}: {e}", old.display()),
-            )
+        let (new, gi) = edits::rename_in_groups(&mut state.groups, &old, &req.new_name).map_err(|e| match e {
+            RenameError::InvalidName(m) => bad_request(m),
+            RenameError::SameName => bad_request(e.to_string()),
+            RenameError::NotInGroups => ApiError(StatusCode::FORBIDDEN, e.to_string()),
+            RenameError::TargetExists(_) => ApiError(StatusCode::CONFLICT, e.to_string()),
+            RenameError::Io(m) => ApiError(StatusCode::INTERNAL_SERVER_ERROR, m),
         })?;
-
-        let scanning = state.is_scanning();
-        let mut updated: Option<GroupReport> = None;
-        for group in &mut state.groups {
-            if let Some(f) = group.files.iter_mut().find(|f| f.path == old) {
-                f.path = new.clone();
-                updated = Some(report::group_report(group));
-                break;
-            }
-        }
-        if scanning {
-            // Later snapshots from the engine still carry the old path.
-            let key = state
-                .renamed_during_scan
-                .iter()
-                .find(|(_, v)| **v == old)
-                .map(|(k, _)| k.clone())
-                .unwrap_or_else(|| old.clone());
-            state.renamed_during_scan.insert(key, new.clone());
+        if state.is_scanning() {
+            state.edits.record_rename(&old, &new);
         }
         if state.scan_id.is_some() {
             state.persist_groups();
         }
         state.version += 1;
-        updated.ok_or_else(|| ApiError(StatusCode::INTERNAL_SERVER_ERROR, "Group vanished during rename".into()))
+        Ok(report::group_report(&state.groups[gi]))
     })
     .await
     .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, format!("Rename task failed: {e}")))??;
@@ -715,6 +679,7 @@ fn router(app: AppState) -> Router {
         .route("/style.css", get(style_css))
         .route("/api/scan", get(api_scan))
         .route("/api/groups", get(api_groups))
+        .route("/api/select", post(api_select))
         .route("/api/events", get(api_events))
         .route("/api/delete", post(api_delete))
         .route("/api/rename", post(api_rename))
@@ -767,8 +732,7 @@ fn run_engine_thread(session: ScanSession, app: AppState) {
                     state.elapsed = Some(elapsed);
                     state.scan_complete = true;
                     state.removed = None;
-                    state.deleted_during_scan.clear();
-                    state.renamed_during_scan.clear();
+                    state.edits.clear();
                     let root = state.root.clone();
                     let scanned = state.progress.scanned_count;
                     let groups = state.groups.clone();
@@ -850,8 +814,10 @@ pub fn serve(opts: ServeOptions) -> Result<()> {
                 started: Instant::now(),
                 deleter,
                 removed: None,
-                deleted_during_scan: HashSet::new(),
-                renamed_during_scan: HashMap::new(),
+                edits: ScanEdits::default(),
+                config: None,
+                deleted_this_run: 0,
+                bytes_freed_this_run: 0,
                 database,
                 scan_id: Some(id),
                 version: 1,
@@ -873,8 +839,10 @@ pub fn serve(opts: ServeOptions) -> Result<()> {
                 started: Instant::now(),
                 deleter,
                 removed: Some(removed),
-                deleted_during_scan: HashSet::new(),
-                renamed_during_scan: HashMap::new(),
+                edits: ScanEdits::default(),
+                config: Some(opts.config.clone()),
+                deleted_this_run: 0,
+                bytes_freed_this_run: 0,
                 database,
                 scan_id: None,
                 version: 0,
@@ -942,8 +910,10 @@ mod tests {
             started: Instant::now(),
             deleter: Deleter::new(DeleteMethod::Permanent, None),
             removed: None,
-            deleted_during_scan: HashSet::new(),
-            renamed_during_scan: HashMap::new(),
+            edits: ScanEdits::default(),
+            config: None,
+            deleted_this_run: 0,
+            bytes_freed_this_run: 0,
             database: None,
             scan_id: None,
             version: 0,
@@ -1032,44 +1002,6 @@ mod tests {
     }
 
     #[test]
-    fn new_name_validation() {
-        assert!(validate_new_name("report.pdf").is_ok());
-        assert!(validate_new_name("with spaces.txt").is_ok());
-        assert!(validate_new_name("v1..2.txt").is_ok());
-        assert!(validate_new_name(".hidden").is_ok());
-        for bad in [
-            "", " lead.txt", "trail.txt ", "a/b.txt", "a\\b.txt", "..", ".", "../x.txt", "nul\0.txt", "/abs.txt",
-        ] {
-            assert!(validate_new_name(bad).is_err(), "{bad:?} should be rejected");
-        }
-        assert!(validate_new_name(&"x".repeat(256)).is_err());
-    }
-
-    #[test]
-    fn filters_classify_size_and_type() {
-        assert_eq!(size_bucket(100), "tiny");
-        assert_eq!(size_bucket(10 * 1024), "small");
-        assert_eq!(size_bucket(5 * 1024 * 1024), "medium");
-        assert_eq!(size_bucket(500 * 1024 * 1024), "large");
-        assert_eq!(file_type(Path::new("/x/photo.JPG")), "image");
-        assert_eq!(file_type(Path::new("/x/clip.mov")), "video");
-        assert_eq!(file_type(Path::new("/x/song.flac")), "audio");
-        assert_eq!(file_type(Path::new("/x/notes.txt")), "document");
-        assert_eq!(file_type(Path::new("/x/site.tar.gz")), "archive");
-        assert_eq!(file_type(Path::new("/x/main.rs")), "code");
-        assert_eq!(file_type(Path::new("/x/blob")), "other");
-
-        let (_dir, _root, state) = fixture();
-        let g = &state.groups[0];
-        assert!(group_matches(g, "", "all", "all"));
-        assert!(group_matches(g, "sub/b", "all", "document"));
-        assert!(group_matches(g, "SUB", "tiny", "all"));
-        assert!(!group_matches(g, "nope", "all", "all"));
-        assert!(!group_matches(g, "", "large", "all"));
-        assert!(!group_matches(g, "", "all", "image"));
-    }
-
-    #[test]
     fn inline_only_for_safe_media_types() {
         let mime = |p: &str| mime_guess::from_path(p).first_or_octet_stream();
         assert!(inline_allowed(&mime("a.png")));
@@ -1101,8 +1033,8 @@ mod tests {
         let c = state.canonical_root.join("c.txt");
         let renamed_b = state.canonical_root.join("sub").join("renamed.txt");
         state.scan_complete = false;
-        state.deleted_during_scan.insert(a.clone());
-        state.renamed_during_scan.insert(b.clone(), renamed_b.clone());
+        state.edits.record_deleted([a.clone()]);
+        state.edits.record_rename(&b, &renamed_b);
 
         let snapshot = vec![DuplicateGroup::new("h".into(), vec![info(&a), info(&b), info(&c)])];
         state.adopt_snapshot(snapshot);
