@@ -1,8 +1,9 @@
-use crate::app::{App, Scope, ViewMode};
+use crate::app::{App, Input, Scope, ViewMode};
+use crate::selection::SelectMode;
 use anyhow::Result;
 use chrono::{DateTime, Local};
 use crossterm::{
-    event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind},
+    event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -59,7 +60,7 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Result<()> 
             continue;
         }
 
-        // Confirmation modal swallows every key.
+        // 1. Confirmation modal swallows every key.
         if app.pending_confirm.is_some() {
             match key.code {
                 KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => app.confirm_delete()?,
@@ -69,10 +70,39 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Result<()> 
             continue;
         }
 
+        // 2. Text input (filter or rename) in the footer.
+        if app.input.is_some() {
+            match key.code {
+                KeyCode::Esc => app.cancel_input(),
+                KeyCode::Enter => app.commit_input(),
+                KeyCode::Backspace => app.input_pop(),
+                KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => app.input_push(c),
+                _ => {}
+            }
+            continue;
+        }
+
+        // 3. Mark-mode menu: letter applies to the group, Shift+letter to all.
+        if app.show_mark_menu {
+            match key.code {
+                KeyCode::Esc | KeyCode::Char('m') | KeyCode::Char('q') => app.show_mark_menu = false,
+                KeyCode::Char(c) => {
+                    if let Some(mode) = SelectMode::from_shortcut(c) {
+                        let scope = if c.is_ascii_uppercase() { Scope::AllGroups } else { Scope::CurrentGroup };
+                        app.show_mark_menu = false;
+                        app.apply_select_mode(mode, scope);
+                    }
+                }
+                _ => {}
+            }
+            continue;
+        }
+
         let keeps_status = matches!(
             key.code,
             KeyCode::Char('a') | KeyCode::Char('A') | KeyCode::Char('o') | KeyCode::Char('O')
                 | KeyCode::Char('d') | KeyCode::Char('D') | KeyCode::Char('c') | KeyCode::Char('C')
+                | KeyCode::Char('z') | KeyCode::Char('t') | KeyCode::Char('e') | KeyCode::Char('x')
         );
         if !keeps_status {
             app.clear_status();
@@ -100,10 +130,17 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Result<()> 
             KeyCode::Char('A') => app.mark_suggested(Scope::AllGroups),
             KeyCode::Char('o') => app.mark_all_but_keeper(Scope::CurrentGroup),
             KeyCode::Char('O') => app.mark_all_but_keeper(Scope::AllGroups),
+            KeyCode::Char('m') => app.show_mark_menu = true,
             KeyCode::Char('c') => app.clear_marks(Scope::CurrentGroup),
             KeyCode::Char('C') => app.clear_marks(Scope::AllGroups),
             KeyCode::Char('d') => app.request_delete(Scope::CurrentGroup),
             KeyCode::Char('D') => app.request_delete(Scope::AllGroups),
+            KeyCode::Char('r') => app.start_rename(),
+            KeyCode::Char('e') | KeyCode::Enter => app.open_selected(),
+            KeyCode::Char('/') => app.start_filter_input(),
+            KeyCode::Char('z') => app.cycle_size_filter(),
+            KeyCode::Char('t') => app.cycle_kind_filter(),
+            KeyCode::Char('x') => app.clear_filter(),
             _ => {}
         }
     }
@@ -125,6 +162,8 @@ fn ui(f: &mut Frame, app: &App) {
 
     if let Some(pending) = &app.pending_confirm {
         render_confirm(f, app, pending);
+    } else if app.show_mark_menu {
+        render_mark_menu(f);
     }
 }
 
@@ -140,12 +179,14 @@ fn render_header(f: &mut Frame, area: Rect, app: &App) {
     )];
     if app.is_scanning() {
         spans.push(Span::styled(
-            format!(
-                "   scanning… {} files, {} groups",
-                app.progress.scanned_count,
-                app.groups.len()
-            ),
+            format!("   scanning… {} files, {} groups", app.progress.scanned_count, app.groups.len()),
             Style::default().fg(Color::Yellow),
+        ));
+    }
+    if app.filter.is_active() {
+        spans.push(Span::styled(
+            format!("   filter: {}", app.filter.describe()),
+            Style::default().fg(Color::Magenta),
         ));
     }
     let header = Paragraph::new(Line::from(spans))
@@ -155,23 +196,37 @@ fn render_header(f: &mut Frame, area: Rect, app: &App) {
 }
 
 fn render_footer(f: &mut Frame, area: Rect, app: &App) {
-    let (text, style) = if let Some(msg) = &app.status_message {
-        (msg.clone(), Style::default().fg(Color::White))
-    } else {
-        let marked = app.marked.len();
-        let keys = match app.view_mode {
-            ViewMode::Duplicates => "j/k file · n/p group · Space mark · a/A suggested · o/O all-but-keeper · c/C clear · d/D delete · Tab view · q quit",
-            ViewMode::Statistics => "Tab: next view · Esc: back · q: quit",
-            ViewMode::Help => "Tab or Esc: back · q: quit",
-        };
-        (
-            format!(
-                "{keys}   [{marked} marked, {}, via {}]",
-                format_size(app.marked_bytes(), BINARY),
-                app.deleter.method().label()
-            ),
-            Style::default().fg(Color::Gray),
-        )
+    let (text, style) = match &app.input {
+        Some(Input::Filter(t)) => (
+            format!("Filter path contains: {t}▏   (Enter apply · Esc cancel)"),
+            Style::default().fg(Color::Magenta),
+        ),
+        Some(Input::Rename { text, .. }) => (
+            format!("Rename to: {text}▏   (Enter apply · Esc cancel)"),
+            Style::default().fg(Color::Yellow),
+        ),
+        None => {
+            if let Some(msg) = &app.status_message {
+                (msg.clone(), Style::default().fg(Color::White))
+            } else {
+                let keys = match app.view_mode {
+                    ViewMode::Duplicates => {
+                        "j/k file · n/p group · Space mark · a/A suggested · o/O keeper · m more · c/C clear · d/D delete · r rename · e open · / z t filter · ? help · q quit"
+                    }
+                    ViewMode::Statistics => "Tab: next view · Esc: back · q: quit",
+                    ViewMode::Help => "Tab or Esc: back · q: quit",
+                };
+                (
+                    format!(
+                        "{keys}   [{} marked, {}, via {}]",
+                        app.marked.len(),
+                        format_size(app.marked_bytes(), BINARY),
+                        app.deleter.method().label()
+                    ),
+                    Style::default().fg(Color::Gray),
+                )
+            }
+        }
     };
     let footer = Paragraph::new(text)
         .style(style)
@@ -190,9 +245,11 @@ fn render_duplicates(f: &mut Frame, area: Rect, app: &App) {
 }
 
 fn render_groups_panel(f: &mut Frame, area: Rect, app: &App) {
-    if app.groups.is_empty() {
+    if app.visible.is_empty() {
         let msg = if app.is_scanning() {
             "Scanning… no duplicates yet"
+        } else if app.filter.is_active() {
+            "No groups match the filter (x clears it)"
         } else {
             "No duplicates found"
         };
@@ -204,15 +261,19 @@ fn render_groups_panel(f: &mut Frame, area: Rect, app: &App) {
         return;
     }
 
-    let visible = area.height.saturating_sub(2) as usize;
-    let start = app.current_group_index.saturating_sub(visible / 2).min(app.groups.len().saturating_sub(visible));
+    let rows = area.height.saturating_sub(2) as usize;
+    let start = app
+        .current_group_index
+        .saturating_sub(rows / 2)
+        .min(app.visible.len().saturating_sub(rows));
     let items: Vec<ListItem> = app
-        .groups
+        .visible
         .iter()
         .enumerate()
         .skip(start)
-        .take(visible.max(1))
-        .map(|(i, group)| {
+        .take(rows.max(1))
+        .map(|(i, &gi)| {
+            let group = &app.groups[gi];
             let marked = app.marked_in_group(group);
             let style = if i == app.current_group_index {
                 Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
@@ -231,12 +292,23 @@ fn render_groups_panel(f: &mut Frame, area: Rect, app: &App) {
         })
         .collect();
 
-    let list = List::new(items).block(Block::default().borders(Borders::ALL).title(format!(
-        "Groups ({}/{}) · {} wasted",
-        app.current_group_index + 1,
-        app.groups.len(),
-        format_size(app.total_wasted(), BINARY)
-    )));
+    let title = if app.filter.is_active() {
+        format!(
+            "Groups ({}/{} of {}) · {} wasted",
+            app.current_group_index + 1,
+            app.visible.len(),
+            app.groups.len(),
+            format_size(app.total_wasted(), BINARY)
+        )
+    } else {
+        format!(
+            "Groups ({}/{}) · {} wasted",
+            app.current_group_index + 1,
+            app.visible.len(),
+            format_size(app.total_wasted(), BINARY)
+        )
+    };
+    let list = List::new(items).block(Block::default().borders(Borders::ALL).title(title));
     f.render_widget(list, area);
 }
 
@@ -334,6 +406,7 @@ fn render_statistics(f: &mut Frame, area: Rect, app: &App) {
         Line::from(""),
         heading("Duplicates"),
         Line::from(vec![label("Groups"), value(app.groups.len().to_string(), Color::Yellow)]),
+        Line::from(vec![label("Visible"), value(format!("{} ({})", app.visible.len(), app.filter.describe()), Color::Magenta)]),
         Line::from(vec![label("Duplicate files"), value(app.total_duplicate_files().to_string(), Color::Yellow)]),
         Line::from(vec![label("Wasted space"), value(format_size(app.total_wasted(), BINARY), Color::Red)]),
         Line::from(vec![label("Marked"), value(format!("{} files, {}", app.marked.len(), format_size(app.marked_bytes(), BINARY)), Color::Magenta)]),
@@ -377,12 +450,22 @@ fn render_help(f: &mut Frame, area: Rect, app: &App) {
         Line::from(""),
         h("Marking"),
         Line::from("  Space          toggle mark on the selected file"),
-        Line::from("  a / A          mark files that look like copies (group / all groups)"),
-        Line::from("  o / O          mark everything except the keeper (group / all groups)"),
-        Line::from("  c / C          clear marks (group / all groups)"),
+        Line::from("  a / A          mark files that look like copies (group / all matching groups)"),
+        Line::from("  o / O          mark everything except the keeper (group / all matching groups)"),
+        Line::from("  m              more rules: all but oldest, newest, shortest or longest path"),
+        Line::from("  c / C          clear marks (group / all)"),
+        Line::from(""),
+        h("Files"),
+        Line::from("  r              rename the selected file (stays in the same folder)"),
+        Line::from("  e / Enter      open the selected file with its default application"),
+        Line::from(""),
+        h("Filtering"),
+        Line::from("  /              filter groups by a path substring"),
+        Line::from("  z              cycle the size filter        t    cycle the type filter"),
+        Line::from("  x              clear all filters"),
         Line::from(""),
         h("Deleting"),
-        Line::from("  d / D          delete marked files (group / all groups), after confirmation"),
+        Line::from("  d / D          delete marked files (group / all matching groups), after confirmation"),
         Line::from(format!("                 method: {}", app.deleter.method().description())),
         Line::from("                 dupscanner never deletes the last copy in a group."),
         Line::from(""),
@@ -399,13 +482,55 @@ fn render_help(f: &mut Frame, area: Rect, app: &App) {
     f.render_widget(help, area);
 }
 
+fn render_mark_menu(f: &mut Frame) {
+    let area = centered_rect(60, 45, f.area());
+    f.render_widget(Clear, area);
+    let mut lines = vec![
+        Line::from(Span::styled(
+            "Mark files for deletion",
+            Style::default().add_modifier(Modifier::BOLD),
+        )),
+        Line::from(Span::styled(
+            "letter: this group    Shift+letter: all matching groups",
+            Style::default().fg(Color::Gray),
+        )),
+        Line::from(""),
+    ];
+    for mode in SelectMode::ALL {
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!("  {}  ", mode.shortcut()),
+                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(mode.label()),
+        ]));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "Each rule replaces existing marks in the groups it touches and never marks every copy.",
+        Style::default().fg(Color::DarkGray),
+    )));
+    lines.push(Line::from(Span::styled("Esc: close", Style::default().fg(Color::Gray))));
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" Auto-select ")
+        .style(Style::default().bg(Color::Black));
+    f.render_widget(Paragraph::new(lines).block(block).wrap(Wrap { trim: false }), area);
+}
+
 fn render_confirm(f: &mut Frame, app: &App, pending: &crate::app::PendingConfirm) {
     let area = centered_rect(70, 50, f.area());
     f.render_widget(Clear, area);
 
     let scope = match pending.scope {
         Scope::CurrentGroup => "this group",
-        Scope::AllGroups => "all groups",
+        Scope::AllGroups => {
+            if app.filter.is_active() {
+                "all matching groups"
+            } else {
+                "all groups"
+            }
+        }
     };
     let mut lines = vec![
         Line::from(Span::styled(

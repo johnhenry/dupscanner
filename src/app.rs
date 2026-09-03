@@ -2,18 +2,24 @@
 //!
 //! `App` drives a `ScanSession`, keeps the latest duplicate groups, tracks
 //! which files the user has marked (by path, so marks survive re-sorting),
+//! filters the visible groups with the shared `GroupFilter`, applies the
+//! shared auto-select rules, replays mid-scan edits onto engine snapshots,
 //! and funnels every removal through `deletion::plan_deletions` and a
 //! `Deleter`, with an explicit confirmation step.
 
 use crate::database::ScanDatabase;
 use crate::deletion::{plan_deletions, Deleter, DeletionPlan, DeletionReport};
 use crate::duplicates::DuplicateGroup;
+use crate::edits::{self, ScanEdits};
 use crate::engine::{EngineEvent, RemovedPaths, ScanSession};
+use crate::filters::GroupFilter;
 use crate::scanner::{ScanConfig, ScanProgress};
+use crate::selection::{self, SelectMode};
 use crate::suggestions::{GroupAnalysis, SuggestionEngine};
 use anyhow::Result;
+use humansize::{format_size, BINARY};
 use std::collections::HashSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -23,6 +29,8 @@ pub enum ViewMode {
     Help,
 }
 
+/// Which groups an action applies to. `AllGroups` means every group that
+/// passes the current filter, matching the web UI's "all matching groups".
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Scope {
     CurrentGroup,
@@ -35,18 +43,32 @@ pub struct PendingConfirm {
     pub scope: Scope,
 }
 
+/// A text field the footer is currently editing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Input {
+    /// Path substring filter.
+    Filter(String),
+    /// New name for the selected file.
+    Rename { path: PathBuf, text: String },
+}
+
 pub struct App {
     pub root_path: PathBuf,
     pub config: Option<ScanConfig>,
     session: Option<ScanSession>,
     removed: Option<RemovedPaths>,
+    edits: ScanEdits,
 
     pub groups: Vec<DuplicateGroup>,
+    /// Indices into `groups` that pass `filter`, in display order.
+    pub visible: Vec<usize>,
+    pub filter: GroupFilter,
     pub progress: ScanProgress,
     pub scan_complete: bool,
     pub elapsed: Option<Duration>,
     scan_started: Instant,
 
+    /// Position within `visible`.
     pub current_group_index: usize,
     pub selected_file_index: usize,
     pub marked: HashSet<PathBuf>,
@@ -58,6 +80,8 @@ pub struct App {
     pub view_mode: ViewMode,
     pub status_message: Option<String>,
     pub pending_confirm: Option<PendingConfirm>,
+    pub input: Option<Input>,
+    pub show_mark_menu: bool,
     pub total_deleted: usize,
     pub total_freed: u64,
     pub last_report: Option<DeletionReport>,
@@ -73,7 +97,10 @@ impl App {
             config: Some(config),
             session: Some(session),
             removed: Some(removed),
+            edits: ScanEdits::default(),
             groups: Vec::new(),
+            visible: Vec::new(),
+            filter: GroupFilter::default(),
             progress: ScanProgress::default(),
             scan_complete: false,
             elapsed: None,
@@ -87,6 +114,8 @@ impl App {
             view_mode: ViewMode::Duplicates,
             status_message: None,
             pending_confirm: None,
+            input: None,
+            show_mark_menu: false,
             total_deleted: 0,
             total_freed: 0,
             last_report: None,
@@ -105,12 +134,15 @@ impl App {
         let mut groups = groups;
         groups.retain(|g| !g.is_empty());
         groups.sort_by(|a, b| b.wasted_space.cmp(&a.wasted_space));
-        App {
+        let mut app = App {
             root_path,
             config: None,
             session: None,
             removed: None,
+            edits: ScanEdits::default(),
             groups,
+            visible: Vec::new(),
+            filter: GroupFilter::default(),
             progress: ScanProgress {
                 scanned_count: files_scanned,
                 ..ScanProgress::default()
@@ -127,10 +159,14 @@ impl App {
             view_mode: ViewMode::Duplicates,
             status_message: None,
             pending_confirm: None,
+            input: None,
+            show_mark_menu: false,
             total_deleted: 0,
             total_freed: 0,
             last_report: None,
-        }
+        };
+        app.refresh_visible();
+        app
     }
 
     pub fn is_scanning(&self) -> bool {
@@ -158,26 +194,32 @@ impl App {
         for ev in events {
             match ev {
                 EngineEvent::Progress(p) => self.progress = p,
-                EngineEvent::Groups(groups) => {
-                    self.groups = groups;
-                    self.clamp_selection();
-                }
+                EngineEvent::Groups(groups) => self.adopt_snapshot(groups),
                 EngineEvent::Complete {
                     finder,
                     progress,
                     elapsed,
                 } => {
-                    self.groups = finder.groups().to_vec();
+                    self.adopt_snapshot(finder.groups().to_vec());
                     self.progress = progress;
                     self.elapsed = Some(elapsed);
                     self.scan_complete = true;
-                    self.clamp_selection();
+                    self.edits.clear();
                     self.record_completed_scan();
                     self.session = None;
+                    self.removed = None;
                     return;
                 }
             }
         }
+    }
+
+    /// Replace the groups with a snapshot from the engine, replaying the
+    /// deletions and renames made through this UI while the scan ran.
+    fn adopt_snapshot(&mut self, mut groups: Vec<DuplicateGroup>) {
+        self.edits.apply(&mut groups);
+        self.groups = groups;
+        self.refresh_visible();
     }
 
     fn record_completed_scan(&mut self) {
@@ -196,37 +238,85 @@ impl App {
         }
     }
 
-    pub fn db_path(&self) -> Option<&std::path::Path> {
+    pub fn db_path(&self) -> Option<&Path> {
         self.database.as_ref().and_then(|d| d.db_path())
+    }
+
+    // ----- filtering ----------------------------------------------------
+
+    /// Recompute `visible` after the groups or the filter changed, keeping
+    /// the selection on the same group when it is still visible.
+    pub fn refresh_visible(&mut self) {
+        let previously_selected = self.visible.get(self.current_group_index).copied();
+        self.groups.retain(|g| !g.is_empty());
+        self.visible = self.filter.apply(&self.groups);
+        if let Some(gi) = previously_selected {
+            if let Some(pos) = self.visible.iter().position(|&v| v == gi) {
+                self.current_group_index = pos;
+            }
+        }
+        self.clamp_selection();
+    }
+
+    pub fn set_path_filter(&mut self, text: String) {
+        self.filter.path = text;
+        self.refresh_visible();
+        self.status_message = Some(format!("Filter: {}", self.filter.describe()));
+    }
+
+    pub fn cycle_size_filter(&mut self) {
+        self.filter.size = self.filter.size.next();
+        self.refresh_visible();
+        self.status_message = Some(format!("Filter: {}", self.filter.describe()));
+    }
+
+    pub fn cycle_kind_filter(&mut self) {
+        self.filter.kind = self.filter.kind.next();
+        self.refresh_visible();
+        self.status_message = Some(format!("Filter: {}", self.filter.describe()));
+    }
+
+    pub fn clear_filter(&mut self) {
+        self.filter = GroupFilter::default();
+        self.refresh_visible();
+        self.status_message = Some("Filter cleared".into());
     }
 
     // ----- navigation -------------------------------------------------
 
+    pub fn current_group_id(&self) -> Option<usize> {
+        self.visible.get(self.current_group_index).copied()
+    }
+
     pub fn current_group(&self) -> Option<&DuplicateGroup> {
-        self.groups.get(self.current_group_index)
+        self.current_group_id().map(|gi| &self.groups[gi])
     }
 
     pub fn current_analysis(&self) -> Option<GroupAnalysis> {
         self.current_group().map(|g| SuggestionEngine::analyze(&g.files))
     }
 
+    pub fn selected_file(&self) -> Option<&crate::scanner::FileInfo> {
+        self.current_group().and_then(|g| g.files.get(self.selected_file_index))
+    }
+
     fn clamp_selection(&mut self) {
-        if self.groups.is_empty() {
+        if self.visible.is_empty() {
             self.current_group_index = 0;
             self.selected_file_index = 0;
             return;
         }
-        if self.current_group_index >= self.groups.len() {
-            self.current_group_index = self.groups.len() - 1;
+        if self.current_group_index >= self.visible.len() {
+            self.current_group_index = self.visible.len() - 1;
         }
-        let n = self.groups[self.current_group_index].files.len();
+        let n = self.groups[self.visible[self.current_group_index]].files.len();
         if self.selected_file_index >= n {
             self.selected_file_index = n.saturating_sub(1);
         }
     }
 
     pub fn next_group(&mut self) {
-        if self.current_group_index + 1 < self.groups.len() {
+        if self.current_group_index + 1 < self.visible.len() {
             self.current_group_index += 1;
             self.selected_file_index = 0;
         }
@@ -245,7 +335,7 @@ impl App {
     }
 
     pub fn last_group(&mut self) {
-        self.current_group_index = self.groups.len().saturating_sub(1);
+        self.current_group_index = self.visible.len().saturating_sub(1);
         self.selected_file_index = 0;
     }
 
@@ -263,83 +353,68 @@ impl App {
 
     // ----- marking ----------------------------------------------------
 
-    pub fn is_marked(&self, path: &std::path::Path) -> bool {
+    pub fn is_marked(&self, path: &Path) -> bool {
         self.marked.contains(path)
     }
 
     pub fn toggle_mark(&mut self) {
-        let Some(group) = self.current_group() else { return };
-        let Some(file) = group.files.get(self.selected_file_index) else { return };
-        let path = file.path.clone();
+        let Some(path) = self.selected_file().map(|f| f.path.clone()) else { return };
         if !self.marked.remove(&path) {
             self.marked.insert(path);
         }
     }
 
-    fn scope_indices(&self, scope: Scope) -> Vec<usize> {
+    fn scope_group_ids(&self, scope: Scope) -> Vec<usize> {
         match scope {
-            Scope::CurrentGroup => self.current_group().map(|_| vec![self.current_group_index]).unwrap_or_default(),
-            Scope::AllGroups => (0..self.groups.len()).collect(),
+            Scope::CurrentGroup => self.current_group_id().into_iter().collect(),
+            Scope::AllGroups => self.visible.clone(),
         }
     }
 
-    /// Mark files the heuristics flag as copies (never the keeper).
+    /// Apply one of the shared auto-select rules. The rule owns the marks
+    /// of every group it touches (existing marks there are replaced).
+    pub fn apply_select_mode(&mut self, mode: SelectMode, scope: Scope) {
+        let ids = self.scope_group_ids(scope);
+        let mut marked = 0usize;
+        let mut touched = 0usize;
+        for gi in &ids {
+            let n = selection::apply_mode(&mut self.marked, &self.groups[*gi], mode);
+            marked += n;
+            if n > 0 {
+                touched += 1;
+            }
+        }
+        self.status_message = Some(match (mode, scope) {
+            (SelectMode::Suggested, Scope::CurrentGroup) if marked == 0 => {
+                "No file in this group looks like a copy. Use 'o' to mark all but the keeper, or Space.".to_string()
+            }
+            (SelectMode::Suggested, Scope::CurrentGroup) => {
+                let conf = self.current_analysis().map(|a| a.confidence()).unwrap_or("");
+                format!("Marked {marked} suggested file(s) ({conf})")
+            }
+            (SelectMode::AllButKeeper, Scope::CurrentGroup) => {
+                let keeper = self
+                    .current_analysis()
+                    .and_then(|a| a.keeper)
+                    .and_then(|k| self.current_group().and_then(|g| g.files.get(k)))
+                    .and_then(|f| f.path.file_name().map(|n| n.to_string_lossy().to_string()))
+                    .unwrap_or_default();
+                format!("Marked {marked} file(s), keeping {keeper}")
+            }
+            (_, Scope::CurrentGroup) => format!("{}: marked {marked} file(s)", mode.label()),
+            (_, Scope::AllGroups) => {
+                let scope_text = if self.filter.is_active() { "matching" } else { "all" };
+                format!("{}: marked {marked} file(s) in {touched} {scope_text} group(s)", mode.label())
+            }
+        });
+    }
+
     pub fn mark_suggested(&mut self, scope: Scope) {
-        let mut marked = 0usize;
-        let mut groups_touched = 0usize;
-        for gi in self.scope_indices(scope) {
-            let group = &self.groups[gi];
-            let analysis = SuggestionEngine::analyze(&group.files);
-            let mut any = false;
-            for s in analysis.suggested_deletions() {
-                if let Some(f) = group.files.get(s.file_index) {
-                    if self.marked.insert(f.path.clone()) {
-                        marked += 1;
-                    }
-                    any = true;
-                }
-            }
-            if any {
-                groups_touched += 1;
-            }
-        }
-        self.status_message = Some(match scope {
-            Scope::CurrentGroup => {
-                if marked == 0 {
-                    "No file in this group looks like a copy. Use 'o' to mark all but the keeper, or Space.".to_string()
-                } else {
-                    let conf = self.current_analysis().map(|a| a.confidence()).unwrap_or("");
-                    format!("Marked {marked} suggested file(s) ({conf})")
-                }
-            }
-            Scope::AllGroups => format!("Marked {marked} suggested file(s) in {groups_touched} group(s)"),
-        });
+        self.apply_select_mode(SelectMode::Suggested, scope);
     }
 
-    /// Mark every file except the keeper.
     pub fn mark_all_but_keeper(&mut self, scope: Scope) {
-        let mut marked = 0usize;
-        for gi in self.scope_indices(scope) {
-            let group = &self.groups[gi];
-            let analysis = SuggestionEngine::analyze(&group.files);
-            for s in analysis.all_but_keeper() {
-                if let Some(f) = group.files.get(s.file_index) {
-                    if self.marked.insert(f.path.clone()) {
-                        marked += 1;
-                    }
-                }
-            }
-        }
-        let keeper = self
-            .current_analysis()
-            .and_then(|a| a.keeper)
-            .and_then(|k| self.current_group().and_then(|g| g.files.get(k)))
-            .and_then(|f| f.path.file_name().map(|n| n.to_string_lossy().to_string()))
-            .unwrap_or_default();
-        self.status_message = Some(match scope {
-            Scope::CurrentGroup => format!("Marked {marked} file(s), keeping {keeper}"),
-            Scope::AllGroups => format!("Marked {marked} file(s) across all groups"),
-        });
+        self.apply_select_mode(SelectMode::AllButKeeper, scope);
     }
 
     pub fn clear_marks(&mut self, scope: Scope) {
@@ -373,32 +448,94 @@ impl App {
             .sum()
     }
 
+    // ----- rename / open ------------------------------------------------
+
+    pub fn start_rename(&mut self) {
+        let Some(file) = self.selected_file() else { return };
+        let name = file.path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+        self.input = Some(Input::Rename {
+            path: file.path.clone(),
+            text: name,
+        });
+    }
+
+    pub fn start_filter_input(&mut self) {
+        self.input = Some(Input::Filter(self.filter.path.clone()));
+    }
+
+    pub fn cancel_input(&mut self) {
+        self.input = None;
+    }
+
+    pub fn input_push(&mut self, c: char) {
+        match &mut self.input {
+            Some(Input::Filter(t)) | Some(Input::Rename { text: t, .. }) => t.push(c),
+            None => {}
+        }
+    }
+
+    pub fn input_pop(&mut self) {
+        match &mut self.input {
+            Some(Input::Filter(t)) | Some(Input::Rename { text: t, .. }) => {
+                t.pop();
+            }
+            None => {}
+        }
+    }
+
+    /// Enter pressed while editing.
+    pub fn commit_input(&mut self) {
+        match self.input.take() {
+            Some(Input::Filter(text)) => self.set_path_filter(text),
+            Some(Input::Rename { path, text }) => self.rename(&path, &text),
+            None => {}
+        }
+    }
+
+    fn rename(&mut self, old: &Path, new_name: &str) {
+        match edits::rename_in_groups(&mut self.groups, old, new_name) {
+            Ok((new, _)) => {
+                if self.marked.remove(old) {
+                    self.marked.insert(new.clone());
+                }
+                if self.is_scanning() {
+                    self.edits.record_rename(old, &new);
+                }
+                self.refresh_visible();
+                if self.scan_complete {
+                    self.persist_groups();
+                }
+                self.status_message = Some(format!("Renamed to {}", new.display()));
+            }
+            Err(e) => self.status_message = Some(format!("Not renamed: {e}")),
+        }
+    }
+
+    /// Open the selected file with the system's default application.
+    pub fn open_selected(&mut self) {
+        let Some(path) = self.selected_file().map(|f| f.path.clone()) else { return };
+        match open::that_detached(&path) {
+            Ok(()) => self.status_message = Some(format!("Opened {}", path.display())),
+            Err(e) => self.status_message = Some(format!("Could not open {}: {e}", path.display())),
+        }
+    }
+
     // ----- deletion ---------------------------------------------------
 
     /// Validate the marked files in `scope` and ask for confirmation.
     pub fn request_delete(&mut self, scope: Scope) {
-        let wanted: HashSet<PathBuf> = match scope {
-            Scope::CurrentGroup => self
-                .current_group()
-                .map(|g| {
-                    g.files
-                        .iter()
-                        .filter(|f| self.marked.contains(&f.path))
-                        .map(|f| f.path.clone())
-                        .collect()
-                })
-                .unwrap_or_default(),
-            Scope::AllGroups => self.marked.clone(),
-        };
+        let ids = self.scope_group_ids(scope);
+        let groups: Vec<DuplicateGroup> = ids.iter().map(|&gi| self.groups[gi].clone()).collect();
+        let wanted: HashSet<PathBuf> = groups
+            .iter()
+            .flat_map(|g| g.files.iter())
+            .filter(|f| self.marked.contains(&f.path))
+            .map(|f| f.path.clone())
+            .collect();
         if wanted.is_empty() {
             self.status_message = Some("Nothing marked. Space marks a file, 'a' marks suggested copies.".into());
             return;
         }
-
-        let groups: Vec<DuplicateGroup> = match scope {
-            Scope::CurrentGroup => self.current_group().cloned().into_iter().collect(),
-            Scope::AllGroups => self.groups.clone(),
-        };
         match plan_deletions(&groups, &wanted) {
             Ok(plan) => self.pending_confirm = Some(PendingConfirm { plan, scope }),
             Err(e) => self.status_message = Some(format!("Not deleting: {e}")),
@@ -418,14 +555,16 @@ impl App {
         for group in &mut self.groups {
             group.remove_paths(&deleted);
         }
-        self.groups.retain(|g| !g.is_empty());
         for p in &deleted {
             self.marked.remove(p);
         }
-        if let Some(removed) = &self.removed {
-            removed.add_all(deleted.iter().cloned());
+        if self.is_scanning() {
+            if let Some(removed) = &self.removed {
+                removed.add_all(deleted.iter().cloned());
+            }
+            self.edits.record_deleted(deleted.iter().cloned());
         }
-        self.clamp_selection();
+        self.refresh_visible();
 
         self.total_deleted += report.deleted_count();
         self.total_freed += report.bytes_freed();
@@ -445,7 +584,7 @@ impl App {
             format!(
                 "Deleted {} file(s) via {method}, freed {}",
                 report.deleted_count(),
-                humansize::format_size(report.bytes_freed(), humansize::BINARY)
+                format_size(report.bytes_freed(), BINARY)
             )
         });
         self.last_report = Some(report);
@@ -475,5 +614,104 @@ impl App {
 
     pub fn clear_status(&mut self) {
         self.status_message = None;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::deletion::DeleteMethod;
+    use crate::scanner::FileInfo;
+    use std::fs;
+    use std::time::SystemTime;
+    use tempfile::TempDir;
+
+    fn info(path: &Path) -> FileInfo {
+        FileInfo {
+            path: path.to_path_buf(),
+            size: 4,
+            quick_hash: None,
+            hash: Some("h".into()),
+            modified: SystemTime::UNIX_EPOCH,
+            depth: path.components().count(),
+        }
+    }
+
+    fn app_with(dir: &Path, groups: Vec<DuplicateGroup>) -> App {
+        App::from_recorded(
+            dir.to_path_buf(),
+            groups,
+            10,
+            Deleter::new(DeleteMethod::Permanent, None),
+            None,
+            None,
+        )
+    }
+
+    #[test]
+    fn filter_narrows_visible_groups_and_scope() {
+        let dir = TempDir::new().unwrap();
+        let g1 = DuplicateGroup::new("1".into(), vec![info(&dir.path().join("a.jpg")), info(&dir.path().join("b.jpg"))]);
+        let g2 = DuplicateGroup::new("2".into(), vec![info(&dir.path().join("c.txt")), info(&dir.path().join("d.txt"))]);
+        let mut app = app_with(dir.path(), vec![g1, g2]);
+        assert_eq!(app.visible.len(), 2);
+
+        app.set_path_filter(".txt".into());
+        assert_eq!(app.visible.len(), 1);
+        assert!(app.current_group().unwrap().files[0].path.ends_with("c.txt"));
+
+        app.mark_all_but_keeper(Scope::AllGroups);
+        assert_eq!(app.marked.len(), 1, "AllGroups scope respects the filter");
+
+        app.clear_filter();
+        assert_eq!(app.visible.len(), 2);
+    }
+
+    #[test]
+    fn auto_select_owns_marks_and_delete_requires_confirmation() {
+        let dir = TempDir::new().unwrap();
+        let a = dir.path().join("a.txt");
+        let b = dir.path().join("b.txt");
+        fs::write(&a, b"same").unwrap();
+        fs::write(&b, b"same").unwrap();
+        let mut app = app_with(dir.path(), vec![DuplicateGroup::new("h".into(), vec![info(&a), info(&b)])]);
+
+        app.toggle_mark(); // marks a (index 0)
+        assert!(app.is_marked(&a));
+        app.mark_all_but_keeper(Scope::CurrentGroup);
+        assert_eq!(app.marked.len(), 1);
+        let keeper = SuggestionEngine::analyze(&app.groups[0].files).keeper.unwrap();
+        assert!(!app.is_marked(&app.groups[0].files[keeper].path));
+
+        app.request_delete(Scope::CurrentGroup);
+        assert!(app.pending_confirm.is_some());
+        assert!(a.exists() && b.exists(), "nothing deleted before confirmation");
+        app.confirm_delete().unwrap();
+        assert_eq!(app.total_deleted, 1);
+        assert!(app.groups.is_empty());
+    }
+
+    #[test]
+    fn rename_moves_mark_and_updates_group() {
+        let dir = TempDir::new().unwrap();
+        let a = dir.path().join("a.txt");
+        let b = dir.path().join("b.txt");
+        fs::write(&a, b"same").unwrap();
+        fs::write(&b, b"same").unwrap();
+        let mut app = app_with(dir.path(), vec![DuplicateGroup::new("h".into(), vec![info(&a), info(&b)])]);
+        app.toggle_mark();
+        app.start_rename();
+        assert!(matches!(app.input, Some(Input::Rename { .. })));
+        for _ in 0..5 {
+            app.input_pop();
+        }
+        for c in "z.txt".chars() {
+            app.input_push(c);
+        }
+        app.commit_input();
+        let z = dir.path().join("z.txt");
+        assert!(z.exists());
+        assert!(app.is_marked(&z));
+        assert!(app.groups[0].files.iter().any(|f| f.path == z));
     }
 }

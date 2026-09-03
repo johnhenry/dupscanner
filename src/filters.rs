@@ -40,16 +40,6 @@ impl SizeBucket {
         }
     }
 
-    pub fn key(&self) -> &'static str {
-        match self {
-            SizeBucket::All => "all",
-            SizeBucket::Tiny => "tiny",
-            SizeBucket::Small => "small",
-            SizeBucket::Medium => "medium",
-            SizeBucket::Large => "large",
-        }
-    }
-
     pub fn label(&self) -> &'static str {
         match self {
             SizeBucket::All => "all sizes",
@@ -122,19 +112,6 @@ impl FileKind {
             "code" => Some(FileKind::Code),
             "other" => Some(FileKind::Other),
             _ => None,
-        }
-    }
-
-    pub fn key(&self) -> &'static str {
-        match self {
-            FileKind::All => "all",
-            FileKind::Image => "image",
-            FileKind::Video => "video",
-            FileKind::Audio => "audio",
-            FileKind::Document => "document",
-            FileKind::Archive => "archive",
-            FileKind::Code => "code",
-            FileKind::Other => "other",
         }
     }
 

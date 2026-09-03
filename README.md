@@ -68,14 +68,19 @@ In the UIs, `a` (or "Mark suggested copies") marks files with a positive score. 
 ```
 j / ↓  k / ↑        select file            n / →  p / ←     next / previous group
 g / G               first / last group      Space            mark or unmark file
-a / A               mark suggested copies (group / all)
-o / O               mark all but keeper (group / all)
+a / A               mark suggested copies (group / all matching groups)
+o / O               mark all but keeper (group / all matching groups)
+m                   more rules: all but oldest, newest, shortest or longest path
 c / C               clear marks (group / all)
-d / D               delete marked files (group / all), after confirmation
+r                   rename the selected file     e / Enter   open it with the default app
+/                   filter by path substring     z / t       cycle size / type filter     x  clear filters
+d / D               delete marked files (group / all matching groups), after confirmation
 Tab                 Duplicates / Statistics / Help      ?  help      q  quit
 ```
 
-Groups appear while the scan is still running; you can start reviewing immediately. Marks are tied to file paths, so they survive re-sorting as new groups arrive.
+Groups appear while the scan is still running; you can start reviewing immediately. Marks are tied to file paths, so they survive re-sorting as new groups arrive, and files you delete or rename mid-scan stay deleted or renamed in later snapshots.
+
+Both UIs use the same rules for filtering (size buckets, file types, path substring), for auto-selecting (the six rules under `m`, which replace existing marks in the groups they touch and never mark every copy), and for renaming and deleting. What you can do in one you can do in the other, apart from image preview, which only the browser can draw; the TUI opens the file in its default application instead.
 
 ## Web UI
 
