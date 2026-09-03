@@ -181,6 +181,9 @@ enum Commands {
         action: RestoreAction,
     },
 
+    /// Print the built-in exclusion patterns and why each exists
+    Excludes,
+
     /// Generate demo data with known duplicates
     Demo {
         /// Directory to create test data in
@@ -286,6 +289,15 @@ fn run() -> Result<()> {
             Ok(())
         }
         Commands::Restore { action } => restore(action),
+        Commands::Excludes => {
+            println!("{}", "Built-in exclusions (skip with --no-default-excludes, add more with -e PATTERN)".bold().cyan());
+            println!("{}", "Bare names and *.ext globs match directory or file names; a matching directory is skipped entirely.".dimmed());
+            println!();
+            for (pattern, reason) in scanner::default_exclusions_with_reasons() {
+                println!("  {:<26} {}", pattern, reason.dimmed());
+            }
+            Ok(())
+        }
         Commands::Demo {
             path,
             num_files,

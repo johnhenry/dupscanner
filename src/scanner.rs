@@ -27,30 +27,109 @@ fn default_batch_size() -> usize {
     1000
 }
 
-/// Default exclusion patterns for directories that almost never contain
-/// duplicates a user wants to act on. Directory patterns are matched against
-/// the directory *name* so the walker can prune whole subtrees.
+/// Default exclusion patterns. Bare names and `*.ext` globs are matched
+/// against each entry's name, so a matching directory is pruned with its
+/// whole subtree. Three kinds of thing are skipped:
+///
+/// * volume and OS metadata that is never user data (`.Trashes`,
+///   `.Spotlight-V100`, `$RECYCLE.BIN`, `lost+found`);
+/// * developer and cache directories where duplicates are expected and
+///   harmless (`.git`, `node_modules`, `target`, `__pycache__`);
+/// * bundles and libraries that look like folders but are single documents
+///   or programs. Deleting a "duplicate" inside `Photos Library.photoslibrary`
+///   or `Xcode.app` corrupts it.
+///
+/// Print the list with `dupscanner excludes`; disable it with
+/// `--no-default-excludes`.
 pub fn get_default_exclusions() -> Vec<String> {
-    [
-        // Version control
-        ".git", ".svn", ".hg",
-        // Package managers and dependencies
-        "node_modules", "bower_components", ".npm", ".yarn",
-        // Build artifacts
-        "target", "dist", "build", ".next", ".nuxt",
-        // IDE and editor files
-        ".vscode", ".idea",
-        // Cache directories
-        ".cache", "__pycache__", ".pytest_cache",
-        // OS metadata files
-        ".DS_Store", "Thumbs.db", "desktop.ini",
-        // Data left behind by older dupscanner versions
-        ".dupscanner",
-    ]
-    .iter()
-    .map(|s| s.to_string())
-    .collect()
+    DEFAULT_EXCLUSIONS.iter().map(|(p, _)| p.to_string()).collect()
 }
+
+/// Default exclusions with the reason for each, for `dupscanner excludes`.
+pub fn default_exclusions_with_reasons() -> &'static [(&'static str, &'static str)] {
+    DEFAULT_EXCLUSIONS
+}
+
+const DEFAULT_EXCLUSIONS: &[(&str, &str)] = &[
+    // Volume and OS metadata
+    (".Trashes", "macOS per-volume trash (deleted copies land here)"),
+    (".Trash", "macOS home trash"),
+    (".Spotlight-V100", "Spotlight index"),
+    (".fseventsd", "macOS filesystem event log"),
+    (".DocumentRevisions-V100", "macOS document version store"),
+    (".TemporaryItems", "macOS temporary items"),
+    (".MobileBackups", "Time Machine local snapshots"),
+    (".DS_Store", "Finder metadata file"),
+    (".VolumeIcon.icns", "volume icon"),
+    ("$RECYCLE.BIN", "Windows recycle bin"),
+    ("System Volume Information", "Windows volume metadata"),
+    ("Thumbs.db", "Windows thumbnail cache file"),
+    ("desktop.ini", "Windows folder settings file"),
+    ("lost+found", "Linux fsck recovery directory"),
+    (".snapshots", "btrfs / snapper snapshots"),
+    (".zfs", "ZFS snapshot directory"),
+    (".dupscanner", "data left by older dupscanner versions"),
+    // Backups: deduplicating inside them defeats their purpose
+    ("Backups.backupdb", "Time Machine backup set"),
+    ("*.backupbundle", "Time Machine network backup"),
+    ("*.sparsebundle", "macOS sparse disk image bundle"),
+    // Bundles and libraries that are really single documents or programs
+    ("*.app", "macOS application bundle"),
+    ("*.framework", "macOS framework bundle"),
+    ("*.appex", "macOS app extension"),
+    ("*.xpc", "macOS XPC service"),
+    ("*.kext", "macOS kernel extension"),
+    ("*.plugin", "macOS plug-in bundle"),
+    ("*.bundle", "macOS bundle"),
+    ("*.prefPane", "macOS preference pane"),
+    ("*.qlgenerator", "macOS Quick Look plug-in"),
+    ("*.photoslibrary", "Apple Photos library"),
+    ("*.aplibrary", "Aperture library"),
+    ("*.musiclibrary", "Apple Music library"),
+    ("*.tvlibrary", "Apple TV library"),
+    ("*.imovielibrary", "iMovie library"),
+    ("*.fcpbundle", "Final Cut Pro library"),
+    ("*.logicx", "Logic Pro project"),
+    ("*.band", "GarageBand project"),
+    ("*.lrcat", "Lightroom catalog"),
+    ("*.lrdata", "Lightroom catalog data"),
+    ("*.lrlibrary", "Lightroom library"),
+    ("*.pvm", "Parallels virtual machine"),
+    ("*.vmwarevm", "VMware virtual machine"),
+    ("*.utm", "UTM virtual machine"),
+    ("*.xcodeproj", "Xcode project bundle"),
+    ("*.xcworkspace", "Xcode workspace bundle"),
+    ("*.playground", "Xcode playground"),
+    // Version control
+    (".git", "git repository data"),
+    (".svn", "Subversion metadata"),
+    (".hg", "Mercurial metadata"),
+    // Dependencies, build output and caches
+    ("node_modules", "npm packages"),
+    ("bower_components", "Bower packages"),
+    (".npm", "npm cache"),
+    (".yarn", "Yarn cache"),
+    (".pnpm-store", "pnpm store"),
+    ("vendor", "vendored dependencies"),
+    (".venv", "Python virtual environment"),
+    ("venv", "Python virtual environment"),
+    ("__pycache__", "Python bytecode cache"),
+    (".pytest_cache", "pytest cache"),
+    (".mypy_cache", "mypy cache"),
+    (".tox", "tox environments"),
+    ("target", "Rust / Maven build output"),
+    ("dist", "build output"),
+    ("build", "build output"),
+    (".next", "Next.js build output"),
+    (".nuxt", "Nuxt build output"),
+    (".gradle", "Gradle cache"),
+    (".cargo", "Cargo registry cache"),
+    (".rustup", "Rust toolchains"),
+    (".cache", "application caches"),
+    (".vscode", "VS Code workspace settings"),
+    (".idea", "JetBrains project settings"),
+    (".dropbox.cache", "Dropbox cache"),
+];
 
 /// Compiled exclusion patterns. A pattern matches a path if it matches the
 /// full path string, the file/directory name, or (for `*/name/*` style
@@ -378,6 +457,25 @@ mod tests {
         assert!(m.matches(Path::new("/proj/.git")));
         assert!(m.matches(Path::new("/proj/.git/config")));
         assert!(!m.matches(Path::new("/proj/src/main.rs")));
+    }
+
+    #[test]
+    fn default_exclusions_prune_bundles_and_volume_metadata() {
+        let m = ExclusionMatcher::new(&get_default_exclusions());
+        for dir in [
+            "/Volumes/X/.Trashes",
+            "/Volumes/X/.Spotlight-V100",
+            "/Volumes/X/Photos Library.photoslibrary",
+            "/Applications/Xcode.app",
+            "/Volumes/X/Backups.backupdb",
+            "/Volumes/X/$RECYCLE.BIN",
+            "/home/u/proj/node_modules",
+        ] {
+            assert!(m.matches(Path::new(dir)), "{dir}");
+        }
+        for keep in ["/Volumes/X/Photos", "/Volumes/X/Documents/report.pdf", "/Volumes/X/apps", "/Volumes/X/build-notes.md"] {
+            assert!(!m.matches(Path::new(keep)), "{keep}");
+        }
     }
 
     #[test]

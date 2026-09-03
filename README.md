@@ -144,6 +144,7 @@ dupscanner history [-n COUNT] [--db FILE]
 dupscanner view ID [--json | --plain] [--delete-method M] [--db FILE]
 dupscanner forget ID [--db FILE]
 dupscanner restore list | file PATH [--to DEST] | clean [--older-than DAYS]
+dupscanner excludes
 dupscanner demo [PATH] [-n FILES] [-d DUPLICATES]
 ```
 
@@ -153,13 +154,24 @@ Scan options, shared by `scan` and `serve`:
 -m, --min-size SIZE          ignore smaller files (1, 10KB, 5MB, 1.5GiB)   [default: 1]
 -x, --max-size SIZE          ignore larger files
 -e, --exclude PATTERN        extra glob to exclude; a bare name prunes whole directories
-    --no-default-excludes    do not skip .git, node_modules, target, dist, build, caches, ...
+    --no-default-excludes    do not apply the built-in exclusions (see `dupscanner excludes`)
     --delete-method METHOD   trash (default), backup, permanent
     --db FILE                scan database                                  [default: ~/.local/share/dupscanner/scans.db]
     --no-record              do not record this scan
 ```
 
 Every completed scan is recorded in one SQLite database, whatever mode produced it. `history` lists them, `view` reopens one in the TUI (or prints it), and `serve --scan-id` reopens one in the browser. Files that have disappeared since the scan are dropped when a scan is reopened.
+
+## Built-in exclusions
+
+Some things should never be deduplicated blindly, so they are skipped unless you pass `--no-default-excludes`. `dupscanner excludes` prints the full list with a reason for each entry. The categories:
+
+- **Volume and OS metadata**: `.Trashes`, `.Trash`, `.Spotlight-V100`, `.fseventsd`, `.DocumentRevisions-V100`, `.TemporaryItems`, `.MobileBackups`, `$RECYCLE.BIN`, `System Volume Information`, `lost+found`, `.snapshots`, `.zfs`, plus `.DS_Store`, `Thumbs.db` and `desktop.ini` files.
+- **Backups**: `Backups.backupdb`, `*.backupbundle`, `*.sparsebundle`. Deduplicating inside a backup defeats its purpose.
+- **Bundles that are really one document or program**: `*.app`, `*.framework`, `*.kext`, `*.plugin`, `*.photoslibrary`, `*.musiclibrary`, `*.imovielibrary`, `*.fcpbundle`, `*.logicx`, `*.lrcat`, `*.lrdata`, virtual machines (`*.pvm`, `*.vmwarevm`, `*.utm`), Xcode projects, and similar. Removing a "duplicate" resource inside one corrupts it.
+- **Version control, dependencies, build output and caches**: `.git`, `node_modules`, `vendor`, `.venv`, `target`, `dist`, `build`, `__pycache__`, `.cache`, `.gradle`, `.cargo`, and friends.
+
+Patterns are plain names or `*.ext` globs matched against each entry's name, so a matching directory is pruned with its whole subtree. Add your own with `-e PATTERN`, repeatable.
 
 ## Data locations
 
