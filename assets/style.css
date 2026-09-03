@@ -59,6 +59,7 @@ body {
   min-height: 100vh;
   display: flex;
   flex-direction: column;
+  padding-bottom: 46px; /* room for the fixed key bar */
 }
 
 h1,
@@ -432,7 +433,8 @@ select {
   border-bottom: none;
 }
 
-.group.collapsed .group-body {
+.group.collapsed .group-body,
+.group.collapsed .group-actions {
   display: none;
 }
 
@@ -640,7 +642,7 @@ select {
 .toasts {
   position: fixed;
   right: 16px;
-  bottom: 16px;
+  bottom: 62px;
   display: flex;
   flex-direction: column;
   gap: 8px;
@@ -890,6 +892,32 @@ select {
     margin-left: 0;
     width: 100%;
   }
+  .filter-row {
+    flex-wrap: wrap;
+  }
+
+  .keybar {
+    font-size: 11.5px;
+    gap: 6px;
+  }
+
+  .keybar-marks {
+    display: none;
+  }
+
+  .stats-body {
+    grid-template-columns: 1fr;
+  }
+
+  .help-list,
+  .stats-list {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .help-list dt,
+  .stats-list dt {
+    margin-top: 6px;
+  }
 }
 
 @media (prefers-reduced-motion: reduce) {
@@ -897,4 +925,270 @@ select {
     animation: none !important;
     transition: none !important;
   }
+}
+
+/* ---- header buttons ---------------------------------------------------- */
+
+.header-buttons {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.icon-btn.active {
+  background: var(--accent-soft);
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.filter-row {
+  display: flex;
+  gap: 6px;
+  min-width: 0;
+}
+
+.filter-row select {
+  min-width: 0;
+}
+
+/* ---- statistics panel (the TUI Statistics view) ------------------------ */
+
+.stats-panel {
+  margin-bottom: 14px;
+  padding: 14px 16px;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow);
+}
+
+.stats-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 10px;
+}
+
+.stats-head h2 {
+  font-size: 15px;
+}
+
+.stats-head .muted,
+.muted {
+  color: var(--text-muted);
+}
+
+.stats-body {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+  gap: 14px 28px;
+}
+
+.stats-section h3,
+.help-section h3 {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--accent);
+  margin-bottom: 6px;
+}
+
+.stats-list,
+.help-list {
+  display: grid;
+  grid-template-columns: max-content minmax(0, 1fr);
+  gap: 4px 14px;
+  margin: 0;
+}
+
+.stats-list dt,
+.help-list dt {
+  color: var(--text-muted);
+  white-space: nowrap;
+}
+
+.stats-list dd,
+.help-list dd {
+  margin: 0;
+  min-width: 0;
+  overflow-wrap: anywhere;
+  font-variant-numeric: tabular-nums;
+}
+
+.stats-list dd.ok {
+  color: var(--success);
+}
+
+.stats-list dd.warn {
+  color: var(--warning);
+}
+
+.stats-list dd.bad {
+  color: var(--danger);
+  font-weight: 600;
+}
+
+.stats-list dd.muted {
+  color: var(--text-muted);
+}
+
+.stats-list dd.accent {
+  color: var(--accent);
+  font-weight: 600;
+}
+
+/* ---- cursor and per-group actions -------------------------------------- */
+
+.group-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding: 8px 14px;
+  border-bottom: 1px solid var(--border);
+  background: var(--bg-elevated);
+}
+
+.group.cursor-group {
+  border-color: var(--accent);
+}
+
+.group.cursor-group .group-head {
+  box-shadow: inset 4px 0 0 var(--accent);
+}
+
+.file {
+  scroll-margin-top: 150px;
+  scroll-margin-bottom: 70px;
+}
+
+.file.cursor {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+  background: color-mix(in srgb, var(--accent-soft) 70%, var(--bg-elevated));
+}
+
+.file.cursor.marked {
+  background: color-mix(in srgb, var(--danger-soft) 70%, var(--accent-soft));
+}
+
+/* ---- key hint bar (the TUI footer) ------------------------------------- */
+
+.keybar {
+  position: fixed;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  z-index: 150;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  min-height: 38px;
+  padding: 6px 16px;
+  background: var(--bg-elevated);
+  border-top: 1px solid var(--border);
+  color: var(--text-muted);
+  font-family: var(--mono);
+  font-size: 12.5px;
+  cursor: default;
+}
+
+.keybar-text {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.keybar-marks {
+  flex: none;
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+
+.keybar.has-status {
+  background: var(--accent-soft);
+  color: var(--text);
+  border-top-color: var(--accent);
+}
+
+.keybar.has-status .keybar-text {
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+
+/* ---- mark menu, confirm and help dialogs ------------------------------- */
+
+.modal:focus {
+  outline: none;
+}
+
+.mark-menu {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.mark-menu-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.mark-menu-row .kbd {
+  width: 26px;
+  text-align: center;
+  font-size: 12.5px;
+  padding: 3px 0;
+}
+
+.mark-menu-label {
+  flex: 1;
+  text-align: left;
+}
+
+.confirm-title {
+  font-size: 15px;
+}
+
+.confirm-method {
+  color: var(--warning);
+}
+
+.confirm-path {
+  color: var(--danger);
+}
+
+.confirm-path::before {
+  content: "x ";
+  font-weight: 700;
+}
+
+.keys-hint {
+  white-space: pre;
+  font-family: var(--mono);
+  font-size: 12px;
+}
+
+.help-section {
+  margin-bottom: 14px;
+}
+
+.help-list dt {
+  white-space: normal;
+}
+
+.help-note {
+  margin: 4px 0 14px;
+  color: var(--text-muted);
+}
+
+.help-note strong {
+  color: var(--text);
+}
+
+.help-keep {
+  color: var(--success);
 }
