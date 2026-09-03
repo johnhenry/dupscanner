@@ -1,5 +1,9 @@
 /* dupscanner web UI. Plain JS, no dependencies. All data from the server is
-   rendered through textContent / DOM construction, never innerHTML. */
+   rendered through textContent / DOM construction, never innerHTML.
+
+   The keyboard model mirrors the terminal UI (src/tui.rs, src/app.rs): a
+   cursor moves over file rows, single letters mark, clear and delete, and a
+   footer bar shows either the key hints or the last status message. */
 (function () {
   "use strict";
 
@@ -7,6 +11,7 @@
 
   const STORAGE_THEME = "dupscanner.theme";
   const STORAGE_FILTERS = "dupscanner.filters";
+  const STORAGE_STATS = "dupscanner.stats";
 
   function loadJSON(key, fallback) {
     try {
@@ -34,15 +39,47 @@
     version: -1,
     groups: [],
     scan: null,
-    /** path -> { hash, size } */
+    /** path -> { hash, size }; hash/size are null until hydrated for
+        files that were marked while off-page (scope "all"). */
     marks: new Map(),
+    /** path -> { hash, size } for every file on the current page */
+    pathIndex: new Map(),
+    /** path -> { group, file, host, row } for rows on the current page */
+    rowRefs: new Map(),
     /** hashes of collapsed groups */
     collapsed: new Set(),
     defaultCollapsed: false,
     fetching: false,
     refetchQueued: false,
     stopped: false,
+    /** keyboard cursor: { hash, path } or null */
+    cursor: null,
+    cursorGroupIndex: 0,
+    /** "page" or "all": scope of the Auto-select dropdown */
+    selectScope: "page",
+    statsOpen: loadJSON(STORAGE_STATS, { open: false }).open === true,
+    /** footer status message (replaces the key hints), like the TUI footer */
+    status: null,
+    /** which modal is open: "confirm" | "markmenu" | "help" | "preview" | "other" | null */
+    modalKind: null,
+    /** optional keydown handler for the open modal; returns true when handled */
+    modalKeys: null,
+    /** host element of the open inline rename form, if any */
+    activeRename: null,
+    hydrating: false,
   };
+
+  const KEY_HINTS = "j/k file · n/p group · Space mark · a/A suggested · o/O keeper · m more · d/D delete · ? help";
+
+  /** Used until /api/scan answers with the server's list. */
+  const FALLBACK_MODES = [
+    { key: "suggested", label: "Mark suggested copies", shortcut: "s" },
+    { key: "allButKeeper", label: "Mark all but keeper", shortcut: "k" },
+    { key: "allButOldest", label: "Mark all but oldest", shortcut: "o" },
+    { key: "allButNewest", label: "Mark all but newest", shortcut: "n" },
+    { key: "allButShortestPath", label: "Mark all but shortest path", shortcut: "h" },
+    { key: "allButLongestPath", label: "Mark all but longest path", shortcut: "l" },
+  ];
 
   const REASONS = {
     InTempDirectory: "in a temp directory",
@@ -57,6 +94,9 @@
   const IMAGE_EXT = ["jpg", "jpeg", "png", "gif", "bmp", "webp", "avif", "ico", "tif", "tiff", "heic"];
   const VIDEO_EXT = ["mp4", "webm", "mov", "m4v", "ogv", "mpg", "mpeg"];
   const AUDIO_EXT = ["mp3", "wav", "ogg", "oga", "m4a", "aac", "flac", "opus", "aiff", "aif"];
+
+  /** Paths listed in the confirmation dialog before "... and N more". */
+  const CONFIRM_LIST_CAP = 200;
 
   // ---- DOM helpers ------------------------------------------------------
 
@@ -119,6 +159,10 @@
     return d.toLocaleString(undefined, { dateStyle: "medium", timeStyle: "short" });
   }
 
+  function plural(n, word) {
+    return n + " " + word + (n === 1 ? "" : "s");
+  }
+
   function baseName(path) {
     const i = path.lastIndexOf("/");
     return i >= 0 ? path.slice(i + 1) : path;
@@ -139,12 +183,45 @@
     return "/api/file?path=" + encodeURIComponent(path) + (download ? "&download=1" : "");
   }
 
-  // ---- toasts -----------------------------------------------------------
+  // ---- toasts and the footer key bar -----------------------------------
 
   function toast(message, kind, ttl) {
     const node = el("div", { class: "toast " + (kind || ""), role: "status", text: message });
     $("toasts").appendChild(node);
     setTimeout(() => node.remove(), ttl || (kind === "error" ? 8000 : 4500));
+  }
+
+  /** Show a status message in the key bar, as the TUI footer does. */
+  function setStatus(message) {
+    state.status = message || null;
+    renderKeybar();
+  }
+
+  function clearStatus() {
+    if (state.status !== null) setStatus(null);
+  }
+
+  /** Status bar plus a transient toast, for actions triggered by mouse or key. */
+  function announce(message, kind) {
+    setStatus(message);
+    toast(message, kind);
+  }
+
+  function renderKeybar() {
+    const bar = $("keybar");
+    const text = $("keybarText");
+    const marks = $("keybarMarks");
+    if (state.status) {
+      bar.classList.add("has-status");
+      text.textContent = state.status;
+      marks.textContent = "";
+      return;
+    }
+    bar.classList.remove("has-status");
+    text.textContent = KEY_HINTS;
+    const { count, bytes } = markedTotals();
+    const method = state.scan ? state.scan.delete_method : "";
+    marks.textContent = "[" + count + " marked, " + formatBytes(bytes) + (method ? ", via " + method : "") + "]";
   }
 
   // ---- fetch helpers ----------------------------------------------------
@@ -205,9 +282,38 @@
 
   // ---- header -----------------------------------------------------------
 
+  function selectModes() {
+    return state.scan && Array.isArray(state.scan.select_modes) && state.scan.select_modes.length
+      ? state.scan.select_modes
+      : FALLBACK_MODES;
+  }
+
+  function modeByKey(key) {
+    return selectModes().find((m) => m.key === key) || null;
+  }
+
+  let modesPopulated = false;
+
+  function populateAutoSelect() {
+    const select = $("autoSelect");
+    const keep = select.value;
+    clear(select);
+    select.appendChild(el("option", { value: "", text: "Choose an action" }));
+    for (const m of selectModes()) {
+      select.appendChild(el("option", { value: m.key, text: m.label + " (" + m.shortcut + ")" }));
+    }
+    select.appendChild(el("option", { value: "clear", text: "Clear marks (this page)" }));
+    select.value = keep;
+    if (select.value !== keep) select.value = "";
+  }
+
   function renderScan(scan) {
     if (!scan) return;
     state.scan = scan;
+    if (!modesPopulated && Array.isArray(scan.select_modes) && scan.select_modes.length) {
+      modesPopulated = true;
+      populateAutoSelect();
+    }
     const root = $("rootPath");
     root.textContent = scan.root;
     root.title = scan.root;
@@ -239,6 +345,8 @@
       "Delete method: " +
       scan.delete_method_description +
       (scan.scan_id !== null && scan.scan_id !== undefined ? ". Recorded as scan #" + scan.scan_id + "." : ".");
+    renderKeybar();
+    renderStats();
   }
 
   async function refreshScan() {
@@ -249,15 +357,94 @@
     }
   }
 
+  // ---- statistics panel (mirrors the TUI Statistics view) --------------
+
+  function renderStats() {
+    const body = $("statsBody");
+    if (!state.statsOpen) return;
+    clear(body);
+    const s = state.scan;
+    if (!s) {
+      body.appendChild(el("p", { class: "muted", text: "Waiting for the scan status..." }));
+      return;
+    }
+    const elapsed = Number(s.elapsed_seconds) || 0;
+    const files = Number(s.progress.files_scanned) || 0;
+    const rate = elapsed > 0 ? files / elapsed : 0;
+    const { count, bytes } = markedTotals();
+
+    const section = (title, rows) => {
+      const dl = el("dl", { class: "stats-list" });
+      for (const [label, value, cls] of rows) {
+        dl.appendChild(el("dt", { text: label }));
+        dl.appendChild(el("dd", { class: cls || null, text: value }));
+      }
+      return el("div", { class: "stats-section" }, [el("h3", { text: title }), dl]);
+    };
+
+    body.appendChild(
+      section("Scan", [
+        ["Location", s.root],
+        ["Status", s.complete ? "Complete" : "In progress", s.complete ? "ok" : "warn"],
+        ["Elapsed", elapsed.toFixed(1) + "s (" + rate.toFixed(0) + " files/s)"],
+        ["Files scanned", formatCount(files), "ok"],
+        ["Bytes scanned", formatBytes(s.progress.bytes_scanned)],
+        ["Unreadable", formatCount(s.progress.unreadable), "muted"],
+      ])
+    );
+    body.appendChild(
+      section("Duplicates", [
+        ["Groups", formatCount(s.group_count), "warn"],
+        ["Duplicate files", formatCount(s.duplicate_files), "warn"],
+        ["Wasted space", formatBytes(s.wasted_space), "bad"],
+        ["Marked", count + " files, " + formatBytes(bytes), "accent"],
+        ["Deleted this run", formatCount(s.deleted_this_run) + " files, " + formatBytes(s.bytes_freed_this_run), "ok"],
+      ])
+    );
+    body.appendChild(
+      section("Safety", [
+        ["Delete method", s.delete_method_description || s.delete_method || "unknown"],
+        ["Database", s.db_path ? s.db_path : "not recorded"],
+      ])
+    );
+    if (s.settings) {
+      body.appendChild(
+        section("Settings", [
+          ["Min size", formatBytes(s.settings.min_size)],
+          ["Max size", s.settings.max_size === null || s.settings.max_size === undefined ? "unlimited" : formatBytes(s.settings.max_size)],
+          ["Exclusions", (Array.isArray(s.settings.exclusions) ? s.settings.exclusions.length : 0) + " patterns"],
+        ])
+      );
+    }
+  }
+
+  function setStatsOpen(open) {
+    state.statsOpen = Boolean(open);
+    $("statsPanel").hidden = !state.statsOpen;
+    $("statsToggle").setAttribute("aria-expanded", String(state.statsOpen));
+    $("statsToggle").classList.toggle("active", state.statsOpen);
+    saveJSON(STORAGE_STATS, { open: state.statsOpen });
+    renderStats();
+  }
+
+  function toggleStats() {
+    setStatsOpen(!state.statsOpen);
+  }
+
   // ---- groups -----------------------------------------------------------
+
+  function filterParams(p) {
+    if (state.filters.path) p.set("path", state.filters.path);
+    if (state.filters.size !== "all") p.set("size", state.filters.size);
+    if (state.filters.type !== "all") p.set("type", state.filters.type);
+    return p;
+  }
 
   function groupsUrl() {
     const p = new URLSearchParams();
     p.set("offset", String(state.offset));
     p.set("limit", String(state.filters.limit));
-    if (state.filters.path) p.set("path", state.filters.path);
-    if (state.filters.size !== "all") p.set("size", state.filters.size);
-    if (state.filters.type !== "all") p.set("type", state.filters.type);
+    filterParams(p);
     return "/api/groups?" + p.toString();
   }
 
@@ -277,7 +464,9 @@
       state.groups = data.groups;
       state.total = data.total;
       state.version = data.version;
+      rebuildPathIndex();
       reconcileMarks();
+      reconcileCursor();
       renderGroups();
       saveFilters();
     } catch (e) {
@@ -291,16 +480,64 @@
     }
   }
 
-  /** Drop marks that point at paths no longer present in groups we can see. */
+  function rebuildPathIndex() {
+    state.pathIndex = new Map();
+    for (const g of state.groups) {
+      for (const f of g.files) state.pathIndex.set(f.path, { hash: g.hash, size: g.file_size });
+    }
+  }
+
+  function knownInfo(path) {
+    return state.pathIndex.get(path) || { hash: null, size: null };
+  }
+
+  /** Drop marks that point at paths no longer present in groups we can see,
+      and fill in hash/size for marks made while the file was off-page. */
   function reconcileMarks() {
     const present = new Map();
-    for (const g of state.groups) {
-      const paths = new Set(g.files.map((f) => f.path));
-      present.set(g.hash, paths);
-    }
+    for (const g of state.groups) present.set(g.hash, new Set(g.files.map((f) => f.path)));
     for (const [path, info] of Array.from(state.marks.entries())) {
+      if (!info.hash) {
+        const known = state.pathIndex.get(path);
+        if (known) state.marks.set(path, known);
+        continue;
+      }
       const paths = present.get(info.hash);
       if (paths && !paths.has(path)) state.marks.delete(path);
+    }
+  }
+
+  /** Fetch hash and size for marks made off-page (scope "all"), so totals
+      and the confirmation dialog are exact. Pages through the filtered list. */
+  async function hydrateMarks() {
+    const need = new Set();
+    for (const [path, info] of state.marks) if (!info.hash) need.add(path);
+    if (need.size === 0 || state.hydrating) return;
+    state.hydrating = true;
+    try {
+      let offset = 0;
+      for (let guard = 0; guard < 200 && need.size > 0; guard++) {
+        const p = new URLSearchParams();
+        p.set("offset", String(offset));
+        p.set("limit", "500");
+        filterParams(p);
+        const data = await api("/api/groups?" + p.toString());
+        for (const g of data.groups) {
+          for (const f of g.files) {
+            if (need.has(f.path)) {
+              state.marks.set(f.path, { hash: g.hash, size: g.file_size });
+              need.delete(f.path);
+            }
+          }
+        }
+        offset += data.groups.length;
+        if (data.groups.length === 0 || offset >= data.total) break;
+      }
+    } catch (_) {
+      /* totals stay approximate until the next successful fetch */
+    } finally {
+      state.hydrating = false;
+      refreshMarkViews();
     }
   }
 
@@ -308,6 +545,10 @@
     let bytes = 0;
     for (const info of state.marks.values()) bytes += Number(info.size) || 0;
     return { count: state.marks.size, bytes };
+  }
+
+  function markedInGroup(group) {
+    return group.files.filter((f) => state.marks.has(f.path));
   }
 
   function updateActionButtons() {
@@ -318,6 +559,15 @@
     const ren = $("batchRename");
     ren.disabled = count === 0;
     ren.textContent = count === 0 ? "Batch rename" : "Batch rename " + count;
+    $("clearAllMarks").disabled = count === 0;
+  }
+
+  /** Everything that shows mark counts: summary, buttons, key bar, stats. */
+  function refreshMarkViews() {
+    renderSummary();
+    updateActionButtons();
+    renderKeybar();
+    renderStats();
   }
 
   function isCollapsed(hash) {
@@ -351,6 +601,8 @@
     const container = $("groups");
     const scrollY = window.scrollY;
     clear(container);
+    state.rowRefs = new Map();
+    state.activeRename = null;
 
     if (state.groups.length === 0) {
       const scanning = state.scan && !state.scan.complete;
@@ -367,15 +619,18 @@
     } else {
       state.groups.forEach((group, i) => container.appendChild(renderGroup(group, state.offset + i + 1)));
     }
-    renderSummary();
+    refreshMarkViews();
     renderPagination();
-    updateActionButtons();
     window.scrollTo(0, scrollY);
   }
 
   function renderGroup(group, index) {
-    const markedHere = group.files.filter((f) => state.marks.has(f.path)).length;
-    const card = el("div", { class: "group" + (isCollapsed(group.hash) ? " collapsed" : ""), "data-hash": group.hash });
+    const markedHere = markedInGroup(group).length;
+    const isCursorGroup = state.cursor && state.cursor.hash === group.hash;
+    const card = el("div", {
+      class: "group" + (isCollapsed(group.hash) ? " collapsed" : "") + (isCursorGroup ? " cursor-group" : ""),
+      "data-hash": group.hash,
+    });
 
     const head = el("div", { class: "group-head", role: "button", tabindex: "0", "aria-expanded": String(!isCollapsed(group.hash)) }, [
       el("span", { class: "chevron", "aria-hidden": "true" }),
@@ -396,10 +651,31 @@
     head.addEventListener("keydown", (e) => {
       if (e.key === "Enter" || e.key === " ") {
         e.preventDefault();
+        e.stopPropagation();
         toggle();
       }
     });
     card.appendChild(head);
+
+    // Per-group actions, the mouse counterpart of a / o / c / d.
+    const stop = (fn) => (e) => {
+      e.stopPropagation();
+      fn();
+    };
+    const actions = el("div", { class: "group-actions" }, [
+      el("button", { type: "button", class: "btn btn-small", text: "Mark suggested", title: "a", onclick: stop(() => runGroupSelect("suggested", group)) }),
+      el("button", { type: "button", class: "btn btn-small", text: "Mark all but keeper", title: "o", onclick: stop(() => runGroupSelect("allButKeeper", group)) }),
+      el("button", { type: "button", class: "btn btn-small", text: "Clear", title: "c", onclick: stop(() => clearGroupMarks(group)) }),
+      el("button", {
+        type: "button",
+        class: "btn btn-small btn-danger group-delete",
+        text: markedHere ? "Delete " + markedHere + " marked in group" : "Delete marked in group",
+        title: "d",
+        disabled: markedHere === 0,
+        onclick: stop(() => requestDelete("group", group)),
+      }),
+    ]);
+    card.appendChild(actions);
 
     const body = el("div", { class: "group-body" });
     for (const file of group.files) body.appendChild(renderFile(group, file));
@@ -409,7 +685,11 @@
 
   function renderFile(group, file) {
     const marked = state.marks.has(file.path);
-    const row = el("div", { class: "file" + (marked ? " marked" : "") + (file.keep ? " keep" : ""), "data-path": file.path });
+    const isCursor = state.cursor && state.cursor.path === file.path;
+    const row = el("div", {
+      class: "file" + (marked ? " marked" : "") + (file.keep ? " keep" : "") + (isCursor ? " cursor" : ""),
+      "data-path": file.path,
+    });
 
     const checkbox = el("input", {
       type: "checkbox",
@@ -419,8 +699,7 @@
     checkbox.addEventListener("change", () => {
       setMark(file.path, group, checkbox.checked);
       row.classList.toggle("marked", checkbox.checked);
-      renderSummary();
-      updateActionButtons();
+      refreshMarkViews();
       updateGroupMarkedCount(group);
     });
     row.appendChild(checkbox);
@@ -461,28 +740,181 @@
       }),
     ]);
     row.appendChild(actions);
+
+    // Clicking the row body moves the cursor there (buttons and the checkbox keep their own job).
+    row.addEventListener("click", (e) => {
+      if (e.target.closest("button, input, .rename-form")) return;
+      setCursor({ g: group, gi: state.groups.indexOf(group), f: file }, { scroll: false });
+    });
+
+    state.rowRefs.set(file.path, { group, file, host: renameHost, row });
     return row;
   }
 
+  function groupCard(hash) {
+    return $("groups").querySelector('.group[data-hash="' + CSS.escape(hash) + '"]');
+  }
+
   function updateGroupMarkedCount(group) {
-    const card = $("groups").querySelector('.group[data-hash="' + CSS.escape(group.hash) + '"]');
+    const card = groupCard(group.hash);
     if (!card) return;
-    const count = group.files.filter((f) => state.marks.has(f.path)).length;
+    const count = markedInGroup(group).length;
     let node = card.querySelector(".group-marked");
     if (count === 0) {
       if (node) node.remove();
-      return;
+    } else {
+      if (!node) {
+        node = el("span", { class: "group-marked" });
+        card.querySelector(".group-title").after(node);
+      }
+      node.textContent = count + " marked";
     }
-    if (!node) {
-      node = el("span", { class: "group-marked" });
-      card.querySelector(".group-title").after(node);
+    const del = card.querySelector(".group-delete");
+    if (del) {
+      del.disabled = count === 0;
+      del.textContent = count ? "Delete " + count + " marked in group" : "Delete marked in group";
     }
-    node.textContent = count + " marked";
   }
 
   function setMark(path, group, on) {
     if (on) state.marks.set(path, { hash: group.hash, size: group.file_size });
     else state.marks.delete(path);
+  }
+
+  /** Set a mark and update the row's checkbox and class without re-rendering. */
+  function setMarkAndRow(path, group, on) {
+    setMark(path, group, on);
+    const ref = state.rowRefs.get(path);
+    if (ref) {
+      ref.row.classList.toggle("marked", on);
+      const cb = ref.row.querySelector('input[type="checkbox"]');
+      if (cb) cb.checked = on;
+    }
+  }
+
+  // ---- cursor (the TUI's selected group / file) ------------------------
+
+  function flatFiles() {
+    const out = [];
+    state.groups.forEach((g, gi) => g.files.forEach((f) => out.push({ g, gi, f })));
+    return out;
+  }
+
+  function cursorIndex(files) {
+    if (!state.cursor) return -1;
+    return files.findIndex((x) => x.f.path === state.cursor.path);
+  }
+
+  function cursorGroupIndex() {
+    if (!state.cursor) return -1;
+    return state.groups.findIndex((g) => g.hash === state.cursor.hash);
+  }
+
+  function setCursor(entry, opts) {
+    const scroll = !(opts && opts.scroll === false);
+    if (!entry) {
+      state.cursor = null;
+      renderCursor(false);
+      return;
+    }
+    state.cursor = { hash: entry.g.hash, path: entry.f.path };
+    state.cursorGroupIndex = entry.gi;
+    if (isCollapsed(entry.g.hash)) {
+      toggleCollapsed(entry.g.hash);
+      const card = groupCard(entry.g.hash);
+      if (card) {
+        card.classList.remove("collapsed");
+        const head = card.querySelector(".group-head");
+        if (head) head.setAttribute("aria-expanded", "true");
+      }
+    }
+    renderCursor(scroll);
+  }
+
+  function renderCursor(scroll) {
+    const container = $("groups");
+    for (const n of container.querySelectorAll(".file.cursor")) n.classList.remove("cursor");
+    for (const n of container.querySelectorAll(".group.cursor-group")) n.classList.remove("cursor-group");
+    if (!state.cursor) return;
+    const ref = state.rowRefs.get(state.cursor.path);
+    if (!ref) return;
+    ref.row.classList.add("cursor");
+    const card = groupCard(state.cursor.hash);
+    if (card) card.classList.add("cursor-group");
+    if (scroll) ref.row.scrollIntoView({ block: "nearest" });
+  }
+
+  /** After a re-fetch, keep the cursor on the same file, else the same
+      group, else the group at the same position (like App::clamp_selection). */
+  function reconcileCursor() {
+    if (!state.cursor) return;
+    if (state.pathIndex.has(state.cursor.path)) return;
+    const gi = state.groups.findIndex((g) => g.hash === state.cursor.hash);
+    if (gi >= 0 && state.groups[gi].files.length) {
+      state.cursor = { hash: state.groups[gi].hash, path: state.groups[gi].files[0].path };
+      state.cursorGroupIndex = gi;
+      return;
+    }
+    if (state.groups.length === 0) {
+      state.cursor = null;
+      return;
+    }
+    const idx = Math.min(state.cursorGroupIndex, state.groups.length - 1);
+    const g = state.groups[idx];
+    state.cursor = g.files.length ? { hash: g.hash, path: g.files[0].path } : null;
+    state.cursorGroupIndex = idx;
+  }
+
+  /** Cursor entry, defaulting to the first file on the page (the TUI always
+      has group 0 selected). Null when the page is empty. */
+  function ensureCursor() {
+    const files = flatFiles();
+    if (files.length === 0) return null;
+    let i = cursorIndex(files);
+    if (i < 0) {
+      i = 0;
+      setCursor(files[0]);
+    }
+    return files[i];
+  }
+
+  function cursorGroup() {
+    const entry = ensureCursor();
+    return entry ? entry.g : null;
+  }
+
+  function moveFile(delta) {
+    const files = flatFiles();
+    if (files.length === 0) return;
+    const i = cursorIndex(files);
+    let next;
+    if (i < 0) next = delta > 0 ? 0 : files.length - 1;
+    else next = Math.min(files.length - 1, Math.max(0, i + delta));
+    setCursor(files[next]);
+  }
+
+  function moveGroup(delta) {
+    if (state.groups.length === 0) return;
+    const gi = cursorGroupIndex();
+    let next;
+    if (gi < 0) next = delta > 0 ? 0 : state.groups.length - 1;
+    else next = Math.min(state.groups.length - 1, Math.max(0, gi + delta));
+    gotoGroup(next);
+  }
+
+  function gotoGroup(gi) {
+    const g = state.groups[gi];
+    if (!g || g.files.length === 0) return;
+    setCursor({ g, gi, f: g.files[0] });
+  }
+
+  function toggleCursorMark() {
+    const entry = ensureCursor();
+    if (!entry) return;
+    const on = !state.marks.has(entry.f.path);
+    setMarkAndRow(entry.f.path, entry.g, on);
+    refreshMarkViews();
+    updateGroupMarkedCount(entry.g);
   }
 
   // ---- pagination -------------------------------------------------------
@@ -497,6 +929,7 @@
 
     const go = (page) => {
       state.offset = (page - 1) * limit;
+      state.cursor = null;
       fetchGroups().then(() => window.scrollTo({ top: 0, behavior: "smooth" }));
     };
     nav.appendChild(el("button", { type: "button", class: "btn", text: "Prev", disabled: current === 1, onclick: () => go(current - 1) }));
@@ -534,6 +967,21 @@
     };
   }
 
+  function filtersChanged() {
+    state.offset = 0;
+    state.cursor = null;
+    fetchGroups();
+  }
+
+  /** z / t: step a filter select to its next option, wrapping around. */
+  function cycleFilter(id, key, label) {
+    const select = $(id);
+    select.selectedIndex = (select.selectedIndex + 1) % select.options.length;
+    state.filters[key] = select.value;
+    filtersChanged();
+    setStatus(label + ": " + select.options[select.selectedIndex].text);
+  }
+
   function initFilters() {
     const path = $("pathFilter");
     const size = $("sizeFilter");
@@ -548,28 +996,24 @@
       pageSize.value = "25";
     }
 
-    const changed = () => {
-      state.offset = 0;
-      fetchGroups();
-    };
     path.addEventListener(
       "input",
       debounce(() => {
         state.filters.path = path.value.trim();
-        changed();
+        filtersChanged();
       }, 250)
     );
     size.addEventListener("change", () => {
       state.filters.size = size.value;
-      changed();
+      filtersChanged();
     });
     type.addEventListener("change", () => {
       state.filters.type = type.value;
-      changed();
+      filtersChanged();
     });
     pageSize.addEventListener("change", () => {
       state.filters.limit = parseInt(pageSize.value, 10) || 25;
-      changed();
+      filtersChanged();
     });
 
     $("expandAll").addEventListener("click", () => {
@@ -583,74 +1027,186 @@
       renderGroups();
     });
 
+    populateAutoSelect();
+    $("selectScope").value = state.selectScope;
+    $("selectScope").addEventListener("change", (e) => {
+      state.selectScope = e.target.value === "all" ? "all" : "page";
+    });
     $("autoSelect").addEventListener("change", (e) => {
       const mode = e.target.value;
       e.target.value = "";
-      if (mode) applyAutoSelect(mode);
+      if (mode) autoSelectFromToolbar(mode);
     });
 
-    $("deleteSelected").addEventListener("click", confirmDelete);
+    $("clearAllMarks").addEventListener("click", clearAllMarks);
+    $("deleteSelected").addEventListener("click", () => requestDelete("all"));
     $("batchRename").addEventListener("click", openBatchRename);
     $("shutdown").addEventListener("click", confirmShutdown);
+    $("statsToggle").addEventListener("click", toggleStats);
+    $("helpBtn").addEventListener("click", openHelp);
   }
 
-  // ---- auto select ------------------------------------------------------
+  // ---- auto select through the server ----------------------------------
 
-  /** Pick the index of the file to keep for the given mode, or -1 for none. */
-  function survivorIndex(files, mode) {
-    let best = 0;
-    const cmp = {
-      allButOldest: (a, b) => new Date(a.modified) - new Date(b.modified),
-      allButNewest: (a, b) => new Date(b.modified) - new Date(a.modified),
-      allButShortest: (a, b) => a.path.length - b.path.length,
-      allButLongest: (a, b) => b.path.length - a.path.length,
-    }[mode];
-    if (!cmp) return -1;
-    for (let i = 1; i < files.length; i++) {
-      if (cmp(files[i], files[best]) < 0) best = i;
+  /** POST /api/select with the current filter and page. */
+  function selectRequest(mode, scope) {
+    const body = {
+      mode: mode,
+      scope: scope === "all" ? "all" : "page",
+      offset: state.offset,
+      limit: state.filters.limit,
+    };
+    if (state.filters.path) body.path = state.filters.path;
+    if (state.filters.size !== "all") body.size = state.filters.size;
+    if (state.filters.type !== "all") body.type = state.filters.type;
+    return postJSON("/api/select", body);
+  }
+
+  /** Unmark everything in `clear`, then mark `paths`. `only` (a Set of
+      paths) restricts both to one group. Returns how many files got marked. */
+  function applySelection(result, only) {
+    let n = 0;
+    for (const p of result.clear || []) {
+      if (only && !only.has(p)) continue;
+      state.marks.delete(p);
     }
-    return best;
+    for (const p of result.paths || []) {
+      if (only && !only.has(p)) continue;
+      state.marks.set(p, knownInfo(p));
+      n++;
+    }
+    return n;
   }
 
-  function applyAutoSelect(mode) {
-    let marked = 0;
-    for (const group of state.groups) {
-      // Auto-select owns the marks of the groups it touches: start clean so
-      // the survivor can never end up marked by an earlier manual click.
-      for (const f of group.files) state.marks.delete(f.path);
-      if (mode === "clear") continue;
+  /** Groups that received at least one mark. Exact for the page; for scope
+      "all" the server's count of groups considered is the best available. */
+  function groupsTouched(result, scope) {
+    if (scope === "all") return Number(result.groups) || 0;
+    const marked = new Set(result.paths || []);
+    return state.groups.filter((g) => g.files.some((f) => marked.has(f.path))).length;
+  }
 
-      let toMark = [];
-      if (mode === "suggested") {
-        toMark = group.files.filter((f) => !f.keep && f.score > 0);
-      } else if (mode === "allButKeeper") {
-        toMark = group.files.filter((f) => !f.keep);
-        if (toMark.length === group.files.length) toMark = toMark.slice(1);
+  /** The TUI's confidence label for a group's suggestions. */
+  function confidence(group) {
+    let max = 0;
+    for (const f of group.files) if (!f.keep && f.score > max) max = f.score;
+    if (max >= 100) return "high confidence";
+    if (max >= 80) return "good confidence";
+    if (max >= 50) return "medium confidence";
+    return "low confidence, review carefully";
+  }
+
+  /** "oldest", "keeper", "shortest path"... from a mode label. */
+  function survivorWord(mode) {
+    return mode.label.replace(/^Mark all but /i, "").toLowerCase();
+  }
+
+  /** Apply a mode to one group on the page (a, o, m-letter, card buttons). */
+  async function runGroupSelect(modeKey, group) {
+    const mode = modeByKey(modeKey);
+    if (!mode) return;
+    const only = new Set(group.files.map((f) => f.path));
+    try {
+      let result = await selectRequest(mode.key, "page");
+      // If the page shifted under us (scan still running), fall back to every matching group.
+      if (!(result.clear || []).some((p) => only.has(p))) result = await selectRequest(mode.key, "all");
+      const n = applySelection(result, only);
+      renderGroups();
+      const gi = state.groups.indexOf(group);
+      if (gi >= 0 && (!state.cursor || state.cursor.hash !== group.hash)) setCursor({ g: group, gi, f: group.files[0] }, { scroll: false });
+
+      const survivor = group.files.find((f) => !state.marks.has(f.path));
+      const survivorName = survivor ? baseName(survivor.path) : "";
+      if (mode.key === "suggested") {
+        setStatus(
+          n === 0
+            ? "No file in this group looks like a copy. Use 'o' to mark all but the keeper, or Space."
+            : "Marked " + n + " suggested file(s) (" + confidence(group) + ")"
+        );
+      } else if (mode.key === "allButKeeper") {
+        const keeper = group.files.find((f) => f.keep) || survivor;
+        setStatus("Marked " + n + " file(s), keeping " + (keeper ? baseName(keeper.path) : survivorName));
       } else {
-        const keep = survivorIndex(group.files, mode);
-        toMark = group.files.filter((_, i) => i !== keep);
+        setStatus("Marked " + n + " file(s), keeping " + survivorName + " (" + survivorWord(mode) + ")");
       }
-      // Never mark every copy of a group.
-      if (toMark.length >= group.files.length) toMark = toMark.slice(0, group.files.length - 1);
-      for (const f of toMark) {
-        setMark(f.path, group, true);
-        marked++;
-      }
+    } catch (e) {
+      announce("Auto-select failed: " + e.message, "error");
     }
+  }
+
+  /** Apply a mode to every group matching the filter (A, O, Shift+letter). */
+  async function runAllSelect(modeKey) {
+    const mode = modeByKey(modeKey);
+    if (!mode) return;
+    try {
+      const result = await selectRequest(mode.key, "all");
+      const n = applySelection(result, null);
+      renderGroups();
+      hydrateMarks();
+      if (mode.key === "suggested") {
+        setStatus("Marked " + n + " suggested file(s) in " + groupsTouched(result, "all") + " group(s)");
+      } else if (mode.key === "allButKeeper") {
+        setStatus("Marked " + n + " file(s) across all groups");
+      } else {
+        setStatus("Marked " + n + " file(s) across all groups, keeping the " + survivorWord(mode));
+      }
+    } catch (e) {
+      announce("Auto-select failed: " + e.message, "error");
+    }
+  }
+
+  /** The Auto-select dropdown: scope from the toggle next to it. */
+  async function autoSelectFromToolbar(modeKey) {
+    if (modeKey === "clear") {
+      clearPageMarks();
+      return;
+    }
+    const mode = modeByKey(modeKey);
+    if (!mode) return;
+    const scope = state.selectScope;
+    try {
+      const result = await selectRequest(mode.key, scope);
+      const n = applySelection(result, null);
+      renderGroups();
+      if (scope === "all") hydrateMarks();
+      const g = groupsTouched(result, scope);
+      announce("Marked " + plural(n, "file") + " in " + plural(g, "group") + (scope === "all" ? "" : " on this page"));
+    } catch (e) {
+      announce("Auto-select failed: " + e.message, "error");
+    }
+  }
+
+  function clearGroupMarks(group) {
+    for (const f of group.files) state.marks.delete(f.path);
     renderGroups();
-    if (mode === "clear") toast("Cleared marks on this page");
-    else if (marked === 0) toast("Nothing matched on this page", "", 3000);
-    else toast("Marked " + marked + " file" + (marked === 1 ? "" : "s") + " on this page");
+    setStatus("Cleared marks in this group");
+  }
+
+  function clearPageMarks() {
+    for (const g of state.groups) for (const f of g.files) state.marks.delete(f.path);
+    renderGroups();
+    announce("Cleared marks on this page");
+  }
+
+  function clearAllMarks() {
+    state.marks.clear();
+    renderGroups();
+    announce("Cleared all marks");
   }
 
   // ---- modal ------------------------------------------------------------
 
   let modalCloseCallback = null;
 
+  function modalOpen() {
+    return !$("modalBackdrop").hidden;
+  }
+
   function openModal(title, bodyNodes, footNodes, opts) {
+    opts = opts || {};
     const backdrop = $("modalBackdrop");
     const modal = $("modal");
-    modal.classList.toggle("wide", Boolean(opts && opts.wide));
+    modal.classList.toggle("wide", Boolean(opts.wide));
     $("modalTitle").textContent = title;
     const body = $("modalBody");
     const foot = $("modalFoot");
@@ -658,10 +1214,16 @@
     clear(foot);
     for (const n of [].concat(bodyNodes || [])) if (n) body.appendChild(n);
     for (const n of [].concat(footNodes || [])) if (n) foot.appendChild(n);
-    modalCloseCallback = (opts && opts.onClose) || null;
+    modalCloseCallback = opts.onClose || null;
+    state.modalKind = opts.kind || "other";
+    state.modalKeys = opts.keys || null;
     backdrop.hidden = false;
-    const focus = modal.querySelector("input, button.btn-primary, button.btn-danger, button");
-    if (focus) focus.focus();
+    if (opts.focus === "modal") {
+      modal.focus();
+    } else {
+      const focus = modal.querySelector("input, button.btn-primary, button.btn-danger, button");
+      if (focus) focus.focus();
+    }
   }
 
   function closeModal() {
@@ -670,6 +1232,8 @@
     backdrop.hidden = true;
     clear($("modalBody"));
     clear($("modalFoot"));
+    state.modalKind = null;
+    state.modalKeys = null;
     if (modalCloseCallback) {
       const cb = modalCloseCallback;
       modalCloseCallback = null;
@@ -682,9 +1246,6 @@
     $("modalBackdrop").addEventListener("click", (e) => {
       if (e.target === e.currentTarget) closeModal();
     });
-    document.addEventListener("keydown", (e) => {
-      if (e.key === "Escape") closeModal();
-    });
   }
 
   // ---- preview ----------------------------------------------------------
@@ -695,6 +1256,7 @@
     const downloadBtn = el("button", { type: "button", class: "btn", text: "Download", onclick: () => downloadFile(file.path) });
     const closeBtn = el("button", { type: "button", class: "btn btn-primary", text: "Close", onclick: closeModal });
     const pathLine = el("p", { class: "muted" }, [el("code", { text: file.path })]);
+    const opts = { wide: true, kind: "preview" };
 
     let content;
     if (IMAGE_EXT.includes(ext)) {
@@ -707,7 +1269,7 @@
       content = el("iframe", { class: "preview-frame", src: url, title: "PDF preview" });
     } else if (ext === "txt" || ext === "text" || ext === "log") {
       content = el("pre", { class: "preview-text", text: "Loading..." });
-      openModal(baseName(file.path), [pathLine, content], [downloadBtn, closeBtn], { wide: true });
+      openModal(baseName(file.path), [pathLine, content], [downloadBtn, closeBtn], opts);
       try {
         const res = await fetch(url);
         if (!res.ok) {
@@ -730,7 +1292,7 @@
     } else {
       content = el("p", { text: "No inline preview for ." + (ext || "this") + " files. Use Download to save a copy." });
     }
-    openModal(baseName(file.path), [pathLine, content], [downloadBtn, closeBtn], { wide: true });
+    openModal(baseName(file.path), [pathLine, content], [downloadBtn, closeBtn], opts);
   }
 
   function downloadFile(path) {
@@ -740,11 +1302,22 @@
 
   // ---- rename -----------------------------------------------------------
 
+  function cancelRename() {
+    if (state.activeRename) {
+      clear(state.activeRename);
+      state.activeRename = null;
+      return true;
+    }
+    return false;
+  }
+
   function showRenameForm(host, group, file) {
+    cancelRename();
     clear(host);
+    state.activeRename = host;
     const input = el("input", { type: "text", class: "rename-input", value: baseName(file.path), "aria-label": "New file name", spellcheck: "false" });
     const save = el("button", { type: "button", class: "btn btn-small btn-primary", text: "Save" });
-    const cancel = el("button", { type: "button", class: "btn btn-small", text: "Cancel", onclick: () => clear(host) });
+    const cancel = el("button", { type: "button", class: "btn btn-small", text: "Cancel", onclick: cancelRename });
     const form = el("div", { class: "rename-form" }, [input, save, cancel]);
     host.appendChild(form);
     input.focus();
@@ -754,16 +1327,17 @@
     const submit = async () => {
       const newName = input.value;
       if (!newName || newName === baseName(file.path)) {
-        clear(host);
+        cancelRename();
         return;
       }
       save.disabled = true;
       try {
         const updated = await renameOne(file.path, newName);
-        toast("Renamed to " + newName, "success");
+        if (state.cursor && state.cursor.path === file.path) state.cursor.path = dirName(file.path) + newName;
+        announce("Renamed to " + newName, "success");
         applyGroupUpdate(updated);
       } catch (e) {
-        toast("Rename failed: " + e.message, "error");
+        announce("Rename failed: " + e.message, "error");
         save.disabled = false;
       }
     };
@@ -774,7 +1348,7 @@
         submit();
       } else if (e.key === "Escape") {
         e.stopPropagation();
-        clear(host);
+        cancelRename();
       }
     });
   }
@@ -797,7 +1371,9 @@
     const i = state.groups.findIndex((g) => g.hash === updated.hash);
     if (i < 0) return fetchGroups();
     state.groups[i] = updated;
+    rebuildPathIndex();
     reconcileMarks();
+    reconcileCursor();
     renderGroups();
   }
 
@@ -836,7 +1412,7 @@
     input.addEventListener("input", renderPreview);
     renderPreview();
 
-    const apply = el("button", { type: "button", class: "btn btn-primary", text: "Rename " + paths.length + " file" + (paths.length === 1 ? "" : "s") });
+    const apply = el("button", { type: "button", class: "btn btn-primary", text: "Rename " + plural(paths.length, "file") });
     const cancel = el("button", { type: "button", class: "btn", text: "Cancel", onclick: closeModal });
     apply.addEventListener("click", async () => {
       const pattern = input.value;
@@ -844,7 +1420,7 @@
       apply.disabled = true;
       cancel.disabled = true;
       const results = el("ul");
-      openModal("Batch rename", [el("p", { text: "Renaming..." }), results], [], {});
+      openModal("Batch rename", [el("p", { text: "Renaming..." }), results], [], { kind: "other" });
       let ok = 0;
       for (let i = 0; i < paths.length; i++) {
         const p = paths[i];
@@ -863,6 +1439,7 @@
       }
       $("modalBody").firstChild.textContent = "Renamed " + ok + " of " + paths.length + " files.";
       $("modalFoot").appendChild(el("button", { type: "button", class: "btn btn-primary", text: "Close", onclick: closeModal }));
+      setStatus("Renamed " + ok + " of " + paths.length + " file(s)");
       fetchGroups();
     });
     input.addEventListener("keydown", (e) => {
@@ -870,57 +1447,411 @@
     });
 
     openModal(
-      "Batch rename " + paths.length + " marked file" + (paths.length === 1 ? "" : "s"),
+      "Batch rename " + plural(paths.length, "marked file"),
       [el("div", { class: "field" }, [el("label", { text: "Pattern" }), input]), help, previewList],
       [cancel, apply],
-      {}
+      { kind: "other" }
     );
   }
 
   // ---- delete -----------------------------------------------------------
 
-  function confirmDelete() {
-    const paths = Array.from(state.marks.keys()).sort();
-    if (paths.length === 0) return;
-    const { bytes } = markedTotals();
-    const method = state.scan ? state.scan.delete_method_description : "unknown";
-    const list = el("div", { class: "path-list" });
-    for (const p of paths) list.appendChild(el("div", { text: p }));
+  /** d / D and the delete buttons: collect marked paths, then confirm. */
+  async function requestDelete(scope, group) {
+    let paths;
+    if (scope === "group") {
+      if (!group) group = cursorGroup();
+      if (!group) return;
+      paths = markedInGroup(group).map((f) => f.path);
+    } else {
+      paths = Array.from(state.marks.keys());
+    }
+    if (paths.length === 0) {
+      setStatus("Nothing marked. Space marks a file, 'a' marks suggested copies.");
+      return;
+    }
+    if (scope !== "group") await hydrateMarks();
+    openConfirmDelete(paths.slice().sort(), scope === "group" ? "this group" : "all groups");
+  }
 
-    const confirmBtn = el("button", { type: "button", class: "btn btn-danger", text: "Delete " + paths.length + " file" + (paths.length === 1 ? "" : "s") });
-    const cancel = el("button", { type: "button", class: "btn", text: "Cancel", onclick: closeModal });
-    confirmBtn.addEventListener("click", async () => {
+  function openConfirmDelete(paths, scopeLabel) {
+    let bytes = 0;
+    for (const p of paths) {
+      const info = state.marks.get(p) || knownInfo(p);
+      bytes += Number(info.size) || 0;
+    }
+    const method = state.scan ? state.scan.delete_method_description : "unknown";
+    const list = el("div", { class: "path-list confirm-list" });
+    for (const p of paths.slice(0, CONFIRM_LIST_CAP)) list.appendChild(el("div", { class: "confirm-path", text: p }));
+    if (paths.length > CONFIRM_LIST_CAP) {
+      list.appendChild(el("div", { class: "muted", text: "... and " + (paths.length - CONFIRM_LIST_CAP) + " more" }));
+    }
+
+    let decided = false;
+    const cancel = el("button", { type: "button", class: "btn", text: "Cancel (n / Esc)", onclick: () => closeModal() });
+    const confirmBtn = el("button", { type: "button", class: "btn btn-danger", text: "Delete (y / Enter)" });
+    const doDelete = async () => {
+      if (decided) return;
+      decided = true;
       confirmBtn.disabled = true;
       cancel.disabled = true;
-      try {
-        const result = await postJSON("/api/delete", { paths: paths });
-        for (const p of result.deleted || []) state.marks.delete(p);
-        closeModal();
-        const failed = (result.failed || []).length;
-        toast(
-          "Deleted " + (result.deleted || []).length + " file" + ((result.deleted || []).length === 1 ? "" : "s") + ", freed " + formatBytes(result.bytes_freed) + (failed ? ", " + failed + " failed" : ""),
-          failed ? "error" : "success"
-        );
-        for (const f of (result.failed || []).slice(0, 3)) toast(f.path + ": " + f.error, "error");
-      } catch (e) {
-        closeModal();
-        toast("Not deleted: " + e.message, "error");
-      } finally {
-        fetchGroups();
-        refreshScan();
-      }
-    });
+      await performDelete(paths);
+    };
+    confirmBtn.addEventListener("click", doDelete);
 
     openModal(
-      "Delete " + paths.length + " marked file" + (paths.length === 1 ? "" : "s") + "?",
+      "Confirm deletion",
       [
-        el("p", {}, ["This frees ", el("strong", { text: formatBytes(bytes) }), ". At least one copy of every group is always kept."]),
-        el("p", { class: "muted" }, ["Delete method: ", el("strong", { text: method })]),
+        el("p", { class: "confirm-title" }, [
+          el("strong", { text: "Delete " + paths.length + " file(s) from " + scopeLabel + ", freeing " + formatBytes(bytes) + "?" }),
+        ]),
+        el("p", { class: "confirm-method", text: "Method: " + method }),
         list,
+        el("p", { class: "muted", text: "dupscanner never deletes the last copy in a group." }),
+        el("p", { class: "muted keys-hint", text: "y / Enter: delete      n / Esc: cancel" }),
       ],
       [cancel, confirmBtn],
-      {}
+      {
+        kind: "confirm",
+        focus: "modal",
+        onClose: () => {
+          if (!decided) setStatus("Deletion cancelled");
+        },
+        keys: (e) => {
+          if (e.key === "y" || e.key === "Y") {
+            doDelete();
+            return true;
+          }
+          if (e.key === "Enter") {
+            // A focused button keeps its native Enter, so Cancel stays Cancel.
+            if (document.activeElement && document.activeElement.tagName === "BUTTON") return false;
+            doDelete();
+            return true;
+          }
+          if (e.key === "n" || e.key === "N" || e.key === "q") {
+            closeModal();
+            return true;
+          }
+          return false;
+        },
+      }
     );
+  }
+
+  async function performDelete(paths) {
+    const label = state.scan ? state.scan.delete_method : "unknown";
+    try {
+      const result = await postJSON("/api/delete", { paths: paths });
+      const deleted = result.deleted || [];
+      const failed = result.failed || [];
+      for (const p of deleted) state.marks.delete(p);
+      modalCloseCallback = null;
+      closeModal();
+      if (failed.length > 0) {
+        announce(
+          "Deleted " + deleted.length + " file(s) via " + label + ", " + failed.length + " failed: " + (failed[0].error || ""),
+          "error"
+        );
+        for (const f of failed.slice(0, 3)) toast(f.path + ": " + f.error, "error");
+      } else {
+        announce("Deleted " + deleted.length + " file(s) via " + label + ", freed " + formatBytes(result.bytes_freed), "success");
+      }
+    } catch (e) {
+      modalCloseCallback = null;
+      closeModal();
+      announce("Not deleting: " + e.message, "error");
+    } finally {
+      fetchGroups();
+      refreshScan();
+    }
+  }
+
+  // ---- mark menu (m) ----------------------------------------------------
+
+  function openMarkMenu() {
+    const group = cursorGroup();
+    if (!group) {
+      setStatus("No group selected");
+      return;
+    }
+    const modes = selectModes();
+    const list = el("div", { class: "mark-menu" });
+    for (const m of modes) {
+      const row = el("div", { class: "mark-menu-row" }, [
+        el("span", { class: "kbd", text: m.shortcut }),
+        el("button", {
+          type: "button",
+          class: "btn btn-small mark-menu-label",
+          text: m.label,
+          title: "Apply to this group (" + m.shortcut + ")",
+          onclick: () => {
+            closeModal();
+            runGroupSelect(m.key, group);
+          },
+        }),
+        el("button", {
+          type: "button",
+          class: "btn btn-small",
+          text: "All groups",
+          title: "Apply to all matching groups (Shift+" + m.shortcut + ")",
+          onclick: () => {
+            closeModal();
+            runAllSelect(m.key);
+          },
+        }),
+      ]);
+      list.appendChild(row);
+    }
+    openModal(
+      "Mark all but...",
+      [
+        el("p", { class: "muted", text: "Press a letter to apply the rule to this group, Shift+letter for all matching groups, Esc to close." }),
+        list,
+      ],
+      [el("button", { type: "button", class: "btn", text: "Close (Esc)", onclick: closeModal })],
+      {
+        kind: "markmenu",
+        focus: "modal",
+        keys: (e) => {
+          if (e.key.length !== 1) return false;
+          const m = modes.find((x) => String(x.shortcut).toLowerCase() === e.key.toLowerCase());
+          if (!m) return false;
+          const all = e.shiftKey || e.key !== e.key.toLowerCase();
+          closeModal();
+          if (all) runAllSelect(m.key);
+          else runGroupSelect(m.key, group);
+          return true;
+        },
+      }
+    );
+  }
+
+  // ---- help (?) ---------------------------------------------------------
+
+  function openHelp() {
+    if (modalOpen() && state.modalKind === "help") {
+      closeModal();
+      return;
+    }
+    const method = state.scan ? state.scan.delete_method_description : "unknown";
+    const modes = selectModes().map((m) => m.shortcut + " " + m.label.replace(/^Mark /, "")).join(", ");
+    const section = (title, rows) => {
+      const dl = el("dl", { class: "help-list" });
+      for (const [keys, desc] of rows) {
+        dl.appendChild(el("dt", {}, keys.split(" / ").map((k, i) => [i ? " / " : null, el("span", { class: "kbd", text: k })]).flat()));
+        dl.appendChild(el("dd", { text: desc }));
+      }
+      return el("div", { class: "help-section" }, [el("h3", { text: title }), dl]);
+    };
+    const body = [
+      section("Navigation", [
+        ["j / ↓", "next file"],
+        ["k / ↑", "previous file"],
+        ["n / →", "next group"],
+        ["p / ←", "previous group"],
+        ["g", "first group on the page"],
+        ["G", "last group on the page"],
+      ]),
+      section("Marking", [
+        ["Space", "toggle mark on the selected file"],
+        ["a / A", "mark files that look like copies (group / all matching groups)"],
+        ["o / O", "mark everything except the keeper (group / all matching groups)"],
+        ["m", "more rules: " + modes + " (letter: group, Shift+letter: all)"],
+        ["c / C", "clear marks (group / everywhere)"],
+      ]),
+      section("Deleting", [
+        ["d / D", "delete marked files (group / all), after confirmation"],
+        ["y / Enter", "confirm the deletion dialog"],
+        ["n / Esc", "cancel the deletion dialog"],
+      ]),
+      el("p", { class: "help-note" }, ["Method: " + method + ". ", el("strong", { text: "dupscanner never deletes the last copy in a group." })]),
+      section("Files", [
+        ["Enter / e", "preview the selected file"],
+        ["r", "rename the selected file"],
+      ]),
+      section("Filters", [
+        ["/", "focus the path filter"],
+        ["z", "cycle the size filter"],
+        ["t", "cycle the type filter"],
+      ]),
+      section("Views", [
+        ["Tab", "toggle the statistics panel"],
+        ["?", "toggle this help"],
+        ["Esc", "close dialogs, cancel a rename, or clear the cursor"],
+      ]),
+      el("p", { class: "help-keep", text: "KEEP marks the file the heuristics would keep: fewest copy signals, then shallowest path, then oldest." }),
+    ];
+    openModal("Help", body, [el("button", { type: "button", class: "btn btn-primary", text: "Close", onclick: closeModal })], {
+      kind: "help",
+      focus: "modal",
+    });
+  }
+
+  // ---- keyboard ---------------------------------------------------------
+
+  const NAV_KEYS = new Set(["ArrowDown", "ArrowUp", "ArrowLeft", "ArrowRight", "Enter", "Escape", "Tab", "PageDown", "PageUp", "Home", "End"]);
+
+  function isEditable(node) {
+    if (!node || node === document.body) return false;
+    const tag = node.tagName;
+    return tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT" || node.isContentEditable === true;
+  }
+
+  function isButtonLike(node) {
+    if (!node || node === document.body) return false;
+    const tag = node.tagName;
+    return tag === "BUTTON" || tag === "A" || tag === "SUMMARY" || node.getAttribute("role") === "button";
+  }
+
+  function onKeydown(e) {
+    const target = e.target;
+    const inModal = modalOpen();
+
+    if (e.key === "Escape") {
+      if (inModal) {
+        e.preventDefault();
+        closeModal();
+        return;
+      }
+      if (isEditable(target)) {
+        target.blur();
+        return;
+      }
+      if (cancelRename()) return;
+      if (state.cursor) setCursor(null);
+      clearStatus();
+      return;
+    }
+
+    if (isEditable(target)) return;
+
+    if (inModal) {
+      if (state.modalKeys && state.modalKeys(e)) {
+        e.preventDefault();
+        return;
+      }
+      if (e.key === "?" && state.modalKind === "help") {
+        e.preventDefault();
+        closeModal();
+      }
+      return;
+    }
+
+    if (e.ctrlKey || e.metaKey || e.altKey) return;
+    if ((e.key === "Enter" || e.key === " ") && (isButtonLike(target) || (target && target.tagName === "INPUT"))) return;
+    if (e.key === "Tab") {
+      if (e.shiftKey) return;
+      e.preventDefault();
+      toggleStats();
+      return;
+    }
+    if (e.key.length !== 1 && !NAV_KEYS.has(e.key)) return;
+
+    // Like the TUI: any key clears the last status, except the ones that set one.
+    const keepsStatus = e.key.length === 1 && "aAoOdDcC".includes(e.key);
+    if (!keepsStatus) clearStatus();
+
+    switch (e.key) {
+      case "j":
+      case "ArrowDown":
+        moveFile(1);
+        break;
+      case "k":
+      case "ArrowUp":
+        moveFile(-1);
+        break;
+      case "n":
+      case "ArrowRight":
+      case "PageDown":
+        moveGroup(1);
+        break;
+      case "p":
+      case "ArrowLeft":
+      case "PageUp":
+        moveGroup(-1);
+        break;
+      case "g":
+      case "Home":
+        gotoGroup(0);
+        break;
+      case "G":
+      case "End":
+        gotoGroup(state.groups.length - 1);
+        break;
+      case " ":
+        toggleCursorMark();
+        break;
+      case "Enter":
+      case "e": {
+        const entry = ensureCursor();
+        if (entry) openPreview(entry.f);
+        break;
+      }
+      case "a": {
+        const g = cursorGroup();
+        if (g) runGroupSelect("suggested", g);
+        break;
+      }
+      case "A":
+        runAllSelect("suggested");
+        break;
+      case "o": {
+        const g = cursorGroup();
+        if (g) runGroupSelect("allButKeeper", g);
+        break;
+      }
+      case "O":
+        runAllSelect("allButKeeper");
+        break;
+      case "c": {
+        const g = cursorGroup();
+        if (g) clearGroupMarks(g);
+        break;
+      }
+      case "C":
+        state.marks.clear();
+        renderGroups();
+        setStatus("Cleared all marks");
+        break;
+      case "m":
+        openMarkMenu();
+        break;
+      case "d":
+        requestDelete("group");
+        break;
+      case "D":
+        requestDelete("all");
+        break;
+      case "r": {
+        const entry = ensureCursor();
+        if (entry) {
+          const ref = state.rowRefs.get(entry.f.path);
+          if (ref) showRenameForm(ref.host, ref.group, ref.file);
+        }
+        break;
+      }
+      case "/":
+        $("pathFilter").focus();
+        $("pathFilter").select();
+        break;
+      case "z":
+        cycleFilter("sizeFilter", "size", "Size filter");
+        break;
+      case "t":
+        cycleFilter("typeFilter", "type", "Type filter");
+        break;
+      case "?":
+        openHelp();
+        break;
+      default:
+        return;
+    }
+    e.preventDefault();
+  }
+
+  function initKeyboard() {
+    document.addEventListener("keydown", onKeydown);
+    $("keybar").addEventListener("click", clearStatus);
   }
 
   // ---- shutdown ---------------------------------------------------------
@@ -938,8 +1869,9 @@
       state.stopped = true;
       if (eventSource) eventSource.close();
       openModal("Server stopped", [el("p", { text: "dupscanner has exited. You can close this tab." })], [], {
+        kind: "other",
         onClose: () => {
-          openModal("Server stopped", [el("p", { text: "dupscanner has exited. You can close this tab." })], [], {});
+          openModal("Server stopped", [el("p", { text: "dupscanner has exited. You can close this tab." })], [], { kind: "other" });
         },
       });
     });
@@ -947,7 +1879,7 @@
       "Stop the dupscanner server?",
       [el("p", { text: "The page stops working until you run dupscanner serve again." })],
       [cancel, stop],
-      {}
+      { kind: "other" }
     );
   }
 
@@ -1009,6 +1941,9 @@
     initTheme();
     initModal();
     initFilters();
+    initKeyboard();
+    setStatsOpen(state.statsOpen);
+    renderKeybar();
     await refreshScan();
     await fetchGroups();
     initEvents();

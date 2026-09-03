@@ -26,7 +26,11 @@
           <div class="stat"><span id="statDupes" class="stat-value">0</span><span class="stat-label">duplicates</span></div>
           <div class="stat"><span id="statWasted" class="stat-value stat-wasted">0 B</span><span class="stat-label">reclaimable</span></div>
           <div class="stat"><span id="statElapsed" class="stat-value">0s</span><span class="stat-label">elapsed</span></div>
-          <button id="themeToggle" class="icon-btn" type="button" aria-label="Toggle dark mode" title="Toggle dark mode">Dark</button>
+          <div class="header-buttons">
+            <button id="statsToggle" class="icon-btn" type="button" aria-expanded="false" aria-controls="statsPanel" title="Toggle the statistics panel (Tab)">Statistics</button>
+            <button id="helpBtn" class="icon-btn" type="button" title="Keyboard shortcuts (?)">Help</button>
+            <button id="themeToggle" class="icon-btn" type="button" aria-label="Toggle dark mode" title="Toggle dark mode">Dark</button>
+          </div>
         </div>
       </div>
       <div id="scanBar" class="scan-bar" hidden>
@@ -36,6 +40,14 @@
     </header>
 
     <main class="main">
+      <section id="statsPanel" class="stats-panel" aria-label="Statistics" hidden>
+        <div class="stats-head">
+          <h2>Statistics</h2>
+          <span class="muted">Tab or the Statistics button toggles this panel</span>
+        </div>
+        <div id="statsBody" class="stats-body"></div>
+      </section>
+
       <section class="toolbar" aria-label="Filters and actions">
         <div class="filter">
           <label for="pathFilter">Path contains</label>
@@ -75,21 +87,21 @@
           </select>
         </div>
         <div class="filter">
-          <label for="autoSelect">Auto-select (this page)</label>
-          <select id="autoSelect">
-            <option value="">Choose an action</option>
-            <option value="suggested">Mark suggested copies</option>
-            <option value="allButKeeper">Mark all but keeper</option>
-            <option value="allButOldest">Mark all but oldest</option>
-            <option value="allButNewest">Mark all but newest</option>
-            <option value="allButShortest">Mark all but shortest path</option>
-            <option value="allButLongest">Mark all but longest path</option>
-            <option value="clear">Clear marks</option>
-          </select>
+          <label for="autoSelect">Auto-select</label>
+          <div class="filter-row">
+            <select id="autoSelect">
+              <option value="">Choose an action</option>
+            </select>
+            <select id="selectScope" aria-label="Auto-select scope">
+              <option value="page">This page</option>
+              <option value="all">All matching groups</option>
+            </select>
+          </div>
         </div>
         <div class="toolbar-actions">
           <button id="expandAll" type="button" class="btn">Expand all</button>
           <button id="collapseAll" type="button" class="btn">Collapse all</button>
+          <button id="clearAllMarks" type="button" class="btn" disabled>Clear all marks</button>
           <button id="batchRename" type="button" class="btn" disabled>Batch rename</button>
           <button id="deleteSelected" type="button" class="btn btn-danger" disabled>Delete marked</button>
         </div>
@@ -105,10 +117,15 @@
       <button id="shutdown" type="button" class="btn btn-ghost">Stop server</button>
     </footer>
 
+    <div id="keybar" class="keybar" role="status" aria-live="polite">
+      <span id="keybarText" class="keybar-text"></span>
+      <span id="keybarMarks" class="keybar-marks"></span>
+    </div>
+
     <div id="toasts" class="toasts" aria-live="polite"></div>
 
     <div id="modalBackdrop" class="modal-backdrop" hidden>
-      <div id="modal" class="modal" role="dialog" aria-modal="true" aria-labelledby="modalTitle">
+      <div id="modal" class="modal" role="dialog" aria-modal="true" aria-labelledby="modalTitle" tabindex="-1">
         <div class="modal-head">
           <h2 id="modalTitle">Title</h2>
           <button id="modalClose" type="button" class="icon-btn" aria-label="Close">Close</button>
