@@ -1192,3 +1192,16 @@ select {
 .help-keep {
   color: var(--success);
 }
+
+.group-canonical {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
+  margin-left: auto;
+  font-size: 0.85em;
+}
+.group-canonical code {
+  padding: 0.1rem 0.35rem;
+  border-radius: 4px;
+  background: var(--code-bg, rgba(127, 127, 127, 0.15));
+}

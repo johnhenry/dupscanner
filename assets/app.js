@@ -675,6 +675,24 @@
         onclick: stop(() => requestDelete("group", group)),
       }),
     ]);
+    if (group.canonical_name) {
+      const note = el("div", { class: "group-canonical" }, [
+        el("span", { class: "muted", text: "Original name: " }),
+        el("code", { text: group.canonical_name }),
+      ]);
+      if (group.suggested_rename) {
+        note.appendChild(
+          el("button", {
+            type: "button",
+            class: "btn btn-small",
+            text: "Rename keeper to " + group.suggested_rename.new_name,
+            title: "N",
+            onclick: stop(() => renameKeeperToCanonical(group)),
+          })
+        );
+      }
+      actions.appendChild(note);
+    }
     card.appendChild(actions);
 
     const body = el("div", { class: "group-body" });
@@ -1351,6 +1369,17 @@
         cancelRename();
       }
     });
+  }
+
+  // Mouse counterpart of the TUI's N key: give the keeper the group's
+  // original name (copy markers such as " (1)" removed).
+  async function renameKeeperToCanonical(group) {
+    if (!group.suggested_rename) {
+      setStatus("No name to restore in this group");
+      return;
+    }
+    const ok = await renameOne(group.suggested_rename.path, group.suggested_rename.new_name);
+    if (ok) setStatus("Renamed keeper to " + group.suggested_rename.new_name);
   }
 
   async function renameOne(path, newName) {

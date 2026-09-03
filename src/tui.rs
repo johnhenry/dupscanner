@@ -1,4 +1,5 @@
 use crate::app::{App, Input, Scope, ViewMode};
+use crate::preview::Preview;
 use crate::selection::SelectMode;
 use anyhow::Result;
 use chrono::{DateTime, Local};
@@ -8,6 +9,7 @@ use crossterm::{
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use humansize::{format_size, BINARY};
+use ratatui_image::{picker::Picker, protocol::StatefulProtocol, Resize, StatefulImage};
 use ratatui::{
     backend::{Backend, CrosstermBackend},
     layout::{Alignment, Constraint, Direction, Layout, Rect},
@@ -17,7 +19,41 @@ use ratatui::{
     Frame, Terminal,
 };
 use std::io;
+use std::path::PathBuf;
 use std::time::Duration;
+
+/// Terminal-side image state: which graphics protocol the terminal speaks
+/// and the encoded image currently on screen.
+pub struct ImagePane {
+    picker: Option<Picker>,
+    current: Option<(PathBuf, StatefulProtocol)>,
+}
+
+impl ImagePane {
+    /// Query the terminal for its graphics protocol. Must run after entering
+    /// the alternate screen and before reading key events. Falls back to
+    /// Unicode half-blocks when the terminal does not answer.
+    fn detect() -> Self {
+        if std::env::var_os("DUPSCANNER_NO_IMAGES").is_some() {
+            return ImagePane { picker: None, current: None };
+        }
+        let picker = Picker::from_query_stdio().unwrap_or_else(|_| Picker::from_fontsize((8, 16)));
+        ImagePane {
+            picker: Some(picker),
+            current: None,
+        }
+    }
+
+    fn protocol_name(&self) -> &'static str {
+        match self.picker.as_ref().map(|p| p.protocol_type()) {
+            Some(ratatui_image::picker::ProtocolType::Kitty) => "kitty graphics",
+            Some(ratatui_image::picker::ProtocolType::Sixel) => "sixel",
+            Some(ratatui_image::picker::ProtocolType::Iterm2) => "iTerm2 inline images",
+            Some(ratatui_image::picker::ProtocolType::Halfblocks) => "Unicode half-blocks",
+            None => "disabled",
+        }
+    }
+}
 
 fn restore_terminal() {
     let _ = disable_raw_mode();
@@ -37,8 +73,9 @@ pub fn run(app: &mut App) -> Result<()> {
     execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
+    let mut pane = ImagePane::detect();
 
-    let res = run_app(&mut terminal, app);
+    let res = run_app(&mut terminal, app, &mut pane);
 
     restore_terminal();
     let _ = terminal.show_cursor();
@@ -47,10 +84,11 @@ pub fn run(app: &mut App) -> Result<()> {
     res
 }
 
-fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Result<()> {
+fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App, pane: &mut ImagePane) -> Result<()> {
     loop {
         app.tick();
-        terminal.draw(|f| ui(f, app))?;
+        app.previewer.poll();
+        terminal.draw(|f| ui(f, app, pane))?;
 
         if !event::poll(Duration::from_millis(100))? {
             continue;
@@ -103,6 +141,7 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Result<()> 
             KeyCode::Char('a') | KeyCode::Char('A') | KeyCode::Char('o') | KeyCode::Char('O')
                 | KeyCode::Char('d') | KeyCode::Char('D') | KeyCode::Char('c') | KeyCode::Char('C')
                 | KeyCode::Char('z') | KeyCode::Char('t') | KeyCode::Char('e') | KeyCode::Char('x')
+                | KeyCode::Char('N') | KeyCode::Char('v')
         );
         if !keeps_status {
             app.clear_status();
@@ -136,17 +175,19 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Result<()> 
             KeyCode::Char('d') => app.request_delete(Scope::CurrentGroup),
             KeyCode::Char('D') => app.request_delete(Scope::AllGroups),
             KeyCode::Char('r') => app.start_rename(),
+            KeyCode::Char('N') => app.rename_keeper_to_canonical(),
             KeyCode::Char('e') | KeyCode::Enter => app.open_selected(),
             KeyCode::Char('/') => app.start_filter_input(),
             KeyCode::Char('z') => app.cycle_size_filter(),
             KeyCode::Char('t') => app.cycle_kind_filter(),
             KeyCode::Char('x') => app.clear_filter(),
+            KeyCode::Char('v') => app.toggle_preview(),
             _ => {}
         }
     }
 }
 
-fn ui(f: &mut Frame, app: &App) {
+fn ui(f: &mut Frame, app: &mut App, pane: &mut ImagePane) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(3), Constraint::Min(10), Constraint::Length(3)])
@@ -154,8 +195,8 @@ fn ui(f: &mut Frame, app: &App) {
 
     render_header(f, chunks[0], app);
     match app.view_mode {
-        ViewMode::Duplicates => render_duplicates(f, chunks[1], app),
-        ViewMode::Statistics => render_statistics(f, chunks[1], app),
+        ViewMode::Duplicates => render_duplicates(f, chunks[1], app, pane),
+        ViewMode::Statistics => render_statistics(f, chunks[1], app, pane),
         ViewMode::Help => render_help(f, chunks[1], app),
     }
     render_footer(f, chunks[2], app);
@@ -211,7 +252,7 @@ fn render_footer(f: &mut Frame, area: Rect, app: &App) {
             } else {
                 let keys = match app.view_mode {
                     ViewMode::Duplicates => {
-                        "j/k file · n/p group · Space mark · a/A suggested · o/O keeper · m more · c/C clear · d/D delete · r rename · e open · / z t filter · ? help · q quit"
+                        "j/k file · n/p group · Space mark · a/A suggested · o/O keeper · m more · c/C clear · d/D delete · r/N rename · e open · / z t filter · ? help · q quit"
                     }
                     ViewMode::Statistics => "Tab: next view · Esc: back · q: quit",
                     ViewMode::Help => "Tab or Esc: back · q: quit",
@@ -235,13 +276,79 @@ fn render_footer(f: &mut Frame, area: Rect, app: &App) {
     f.render_widget(footer, area);
 }
 
-fn render_duplicates(f: &mut Frame, area: Rect, app: &App) {
+fn render_duplicates(f: &mut Frame, area: Rect, app: &mut App, pane: &mut ImagePane) {
     let chunks = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(32), Constraint::Percentage(68)])
         .split(area);
     render_groups_panel(f, chunks[0], app);
-    render_files_panel(f, chunks[1], app);
+
+    let selected = app.selected_file().map(|f| f.path.clone());
+    let show_pane = app.show_preview && selected.is_some();
+    if show_pane {
+        let right = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
+            .split(chunks[1]);
+        render_files_panel(f, right[0], app);
+        render_preview_panel(f, right[1], app, pane, selected.as_deref().unwrap_or(std::path::Path::new("")));
+    } else {
+        render_files_panel(f, chunks[1], app);
+    }
+}
+
+fn render_preview_panel(f: &mut Frame, area: Rect, app: &mut App, pane: &mut ImagePane, path: &std::path::Path) {
+    let name = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(format!(" Preview · {} · {} · v hides ", truncate_middle(&name, 40), pane.protocol_name()));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    if inner.width < 4 || inner.height < 2 {
+        return;
+    }
+
+    let placeholder = |f: &mut Frame, text: String, color: Color| {
+        let p = Paragraph::new(text)
+            .style(Style::default().fg(color))
+            .alignment(Alignment::Center)
+            .wrap(Wrap { trim: true });
+        f.render_widget(p, inner);
+    };
+
+    if pane.picker.is_none() {
+        placeholder(f, "Image preview disabled (DUPSCANNER_NO_IMAGES is set). Press e to open the file.".into(), Color::DarkGray);
+        return;
+    }
+
+    match app.previewer.get(path) {
+        Preview::Unsupported => {
+            let kind = crate::filters::FileKind::of(path);
+            placeholder(
+                f,
+                format!("No terminal preview for {} files. Press e to open with the default application.", kind.label()),
+                Color::DarkGray,
+            );
+        }
+        Preview::Loading => placeholder(f, "Decoding…".into(), Color::Yellow),
+        Preview::Failed(e) => placeholder(f, format!("Could not decode image: {e}"), Color::Red),
+        Preview::Ready(img) => {
+            let needs_new = match &pane.current {
+                Some((p, _)) => p != path,
+                None => true,
+            };
+            if needs_new {
+                if let Some(picker) = &pane.picker {
+                    let protocol = picker.new_resize_protocol((*img).clone());
+                    pane.current = Some((path.to_path_buf(), protocol));
+                }
+            }
+            if let Some((_, protocol)) = &mut pane.current {
+                let widget = StatefulImage::default().resize(Resize::Fit(None));
+                f.render_stateful_widget(widget, inner, protocol);
+            }
+        }
+    }
 }
 
 fn render_groups_panel(f: &mut Frame, area: Rect, app: &App) {
@@ -372,8 +479,11 @@ fn render_files_panel(f: &mut Frame, area: Rect, app: &App) {
         })
         .collect();
 
+    let canonical = crate::naming::canonical_name(group)
+        .map(|c| format!(" · original name: {}{}", c.name, if c.existing.is_none() { " (N restores it)" } else { "" }))
+        .unwrap_or_default();
     let list = List::new(items).block(Block::default().borders(Borders::ALL).title(format!(
-        "Files · {} × {} · hash {}",
+        "Files · {} × {} · hash {}{canonical}",
         group.file_count(),
         format_size(group.file_size(), BINARY),
         group.hash.chars().take(12).collect::<String>()
@@ -381,7 +491,7 @@ fn render_files_panel(f: &mut Frame, area: Rect, app: &App) {
     f.render_widget(list, area);
 }
 
-fn render_statistics(f: &mut Frame, area: Rect, app: &App) {
+fn render_statistics(f: &mut Frame, area: Rect, app: &App, pane: &ImagePane) {
     let label = |s: &str| Span::styled(format!("  {s:<18}"), Style::default().fg(Color::Gray));
     let value = |s: String, c: Color| Span::styled(s, Style::default().fg(c));
     let heading = |s: &'static str| Line::from(Span::styled(s, Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)));
@@ -414,6 +524,7 @@ fn render_statistics(f: &mut Frame, area: Rect, app: &App) {
         Line::from(""),
         heading("Safety"),
         Line::from(vec![label("Delete method"), value(app.deleter.method().description().into(), Color::White)]),
+        Line::from(vec![label("Image preview"), value(pane.protocol_name().into(), Color::White)]),
         Line::from(vec![
             label("Database"),
             value(
@@ -457,7 +568,9 @@ fn render_help(f: &mut Frame, area: Rect, app: &App) {
         Line::from(""),
         h("Files"),
         Line::from("  r              rename the selected file (stays in the same folder)"),
+        Line::from("  N              rename the keeper to the group's original name (e.g. drop \" (1)\")"),
         Line::from("  e / Enter      open the selected file with its default application"),
+        Line::from("  v              show or hide the image preview pane (JPEG, PNG, GIF, WebP, BMP, TIFF)"),
         Line::from(""),
         h("Filtering"),
         Line::from("  /              filter groups by a path substring"),

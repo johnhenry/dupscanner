@@ -7,6 +7,8 @@ mod duplicates;
 mod edits;
 mod engine;
 mod filters;
+mod naming;
+mod preview;
 mod paths;
 mod report;
 mod scanner;
@@ -105,6 +107,11 @@ enum Commands {
         /// Non-interactive: print the duplicate groups as JSON and exit
         #[arg(long)]
         json: bool,
+
+        /// With --yolo: after deleting, rename each keeper to the group's
+        /// original name when its copies carried markers like " (1)"
+        #[arg(long, requires = "yolo")]
+        rename_keepers: bool,
     },
 
     /// Scan a directory and review duplicates in a local web UI
@@ -212,7 +219,12 @@ fn main() {
 fn run() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
-        Commands::Scan { args, yolo, json } => {
+        Commands::Scan {
+            args,
+            yolo,
+            json,
+            rename_keepers,
+        } => {
             if yolo && json {
                 bail!("--yolo and --json cannot be combined");
             }
@@ -221,7 +233,7 @@ fn run() -> Result<()> {
             if json {
                 scan_json(config)
             } else if yolo {
-                yolo_scan(config, deleter, database)
+                yolo_scan(config, deleter, database, rename_keepers)
             } else {
                 let mut app = app::App::new_scan(config, deleter, database);
                 tui::run(&mut app)?;
@@ -379,7 +391,12 @@ fn scan_json(config: ScanConfig) -> Result<()> {
     Ok(())
 }
 
-fn yolo_scan(config: ScanConfig, mut deleter: Deleter, mut database: Option<ScanDatabase>) -> Result<()> {
+fn yolo_scan(
+    config: ScanConfig,
+    mut deleter: Deleter,
+    mut database: Option<ScanDatabase>,
+    rename_keepers: bool,
+) -> Result<()> {
     println!("{}", "YOLO mode: keep the best copy in each group, delete the rest".bold().bright_yellow());
     println!("   {}: {}", "Path".bold(), config.root_path.display());
     println!("   {}: {}", "Delete method".bold(), deleter.method().description());
@@ -410,9 +427,15 @@ fn yolo_scan(config: ScanConfig, mut deleter: Deleter, mut database: Option<Scan
     };
 
     let mut wanted = std::collections::HashSet::new();
+    let mut keeper_renames: Vec<(PathBuf, String)> = Vec::new();
     for group in &groups {
         let analysis = SuggestionEngine::analyze(&group.files);
         let keeper = analysis.keeper.unwrap_or(0);
+        if rename_keepers {
+            if let Some(r) = naming::suggested_rename(group, keeper) {
+                keeper_renames.push(r);
+            }
+        }
         println!(
             "{} {} × {}  keeping {}",
             "•".dimmed(),
@@ -437,17 +460,46 @@ fn yolo_scan(config: ScanConfig, mut deleter: Deleter, mut database: Option<Scan
         eprintln!("   {} {}: {err}", "failed".yellow().bold(), path.display());
     }
 
+    let deleted = report.deleted_paths();
+    let mut remaining: Vec<_> = groups
+        .iter()
+        .cloned()
+        .map(|mut g| {
+            g.remove_paths(&deleted);
+            g
+        })
+        .filter(|g| !g.is_empty())
+        .collect();
+
+    let mut renamed = 0usize;
+    for (path, new_name) in &keeper_renames {
+        // Only rename when every marked copy of that group is gone, so the
+        // clean name cannot collide with a copy that failed to delete.
+        if remaining.iter().any(|g| g.files.iter().any(|f| &f.path == path)) {
+            continue;
+        }
+        let mut solo = vec![crate::duplicates::DuplicateGroup::new(
+            String::new(),
+            groups
+                .iter()
+                .flat_map(|g| g.files.iter())
+                .filter(|f| &f.path == path)
+                .cloned()
+                .collect(),
+        )];
+        match edits::rename_in_groups(&mut solo, path, new_name) {
+            Ok((new, _)) => {
+                println!("   {} {} -> {}", "renamed".cyan().bold(), path.display(), new.display());
+                renamed += 1;
+            }
+            Err(e) => eprintln!("   {} {}: {e}", "not renamed".yellow().bold(), path.display()),
+        }
+    }
+    if rename_keepers && renamed > 0 {
+        remaining.retain(|g| !g.is_empty());
+    }
+
     if let (Some(db), Some(id)) = (database.as_mut(), scan_id) {
-        let deleted = report.deleted_paths();
-        let remaining: Vec<_> = groups
-            .iter()
-            .cloned()
-            .map(|mut g| {
-                g.remove_paths(&deleted);
-                g
-            })
-            .filter(|g| !g.is_empty())
-            .collect();
         let _ = db.save_groups(id, &remaining);
     }
 

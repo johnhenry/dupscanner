@@ -50,8 +50,19 @@ Every file in a group gets a score. Positive signals make it a better candidate 
 | Deepest path in the group | +20 | |
 | Longest filename in the group (by more than 5 characters) | +10 | |
 | Inside Documents, Pictures, Photos, Music, Videos, Movies, Projects, src or Desktop | -40 | `~/Documents/report.pdf` |
+| Already carries the group's original name (see below) | -30 | `report.pdf` next to `report (1).pdf` |
 
 The keeper is the lowest score. Ties go to the shallower path, then the older file, then the shorter path, so the choice is the same every run. Only the filename is inspected for copy patterns, so a folder called "Copy Editing" does not taint the files inside it.
+
+### Original names
+
+Copies arrive with predictable decorations: `report (1).pdf`, `report copy.pdf`, `report - Copy (2).pdf`, `Copy of report.pdf`, `photo 2.jpg`. dupscanner strips those markers from every member of a group and takes the most common base plus extension as the group's original name. That name is used three ways:
+
+- A file that already has it is preferred as the keeper.
+- Files that only differ from it by a marker are scored as copies. A bare trailing digit (`photo 2.jpg`) counts only when `photo.jpg` is also in the group, so sequential names like `chapter 12.md` are left alone.
+- When no surviving copy has the original name and the name is free, dupscanner offers to rename the keeper: `N` in the TUI, the "Rename keeper to ..." button in the web UI, or `--rename-keepers` with `--yolo`.
+
+Names never decide what is a duplicate. Size and full SHA-256 do that first; names only decide which copy to keep and what to call it.
 
 In the UIs, `a` (or "Mark suggested copies") marks files with a positive score. `o` (or "Mark all but keeper") marks everything except the keeper. You can always mark files by hand.
 
@@ -72,7 +83,8 @@ a / A               mark suggested copies (group / all matching groups)
 o / O               mark all but keeper (group / all matching groups)
 m                   more rules: all but oldest, newest, shortest or longest path
 c / C               clear marks (group / all)
-r                   rename the selected file     e / Enter   open it with the default app
+r                   rename the selected file     N           rename the keeper to the original name
+e / Enter           open with the default app    v           show / hide the image preview pane
 /                   filter by path substring     z / t       cycle size / type filter     x  clear filters
 d / D               delete marked files (group / all matching groups), after confirmation
 Tab                 Duplicates / Statistics / Help      ?  help      q  quit
@@ -80,7 +92,20 @@ Tab                 Duplicates / Statistics / Help      ?  help      q  quit
 
 Groups appear while the scan is still running; you can start reviewing immediately. Marks are tied to file paths, so they survive re-sorting as new groups arrive, and files you delete or rename mid-scan stay deleted or renamed in later snapshots.
 
-Both UIs use the same rules for filtering (size buckets, file types, path substring), for auto-selecting (the six rules under `m`, which replace existing marks in the groups they touch and never mark every copy), and for renaming and deleting. What you can do in one you can do in the other, apart from image preview, which only the browser can draw; the TUI opens the file in its default application instead.
+Both UIs use the same rules for filtering (size buckets, file types, path substring), for auto-selecting (the six rules under `m`, which replace existing marks in the groups they touch and never mark every copy), and for renaming and deleting. What you can do in one you can do in the other.
+
+### Image preview in the terminal
+
+The preview pane (toggle with `v`) shows the selected image for JPEG, PNG, GIF, WebP, BMP, TIFF, ICO and QOI files. Decoding runs on a background thread and results are cached, so scrolling stays responsive. The pane picks the best graphics protocol the terminal offers:
+
+| Terminal | Output |
+|---|---|
+| kitty, WezTerm, Ghostty, recent Konsole | pixel-perfect (kitty graphics protocol) |
+| iTerm2, WezTerm on macOS | pixel-perfect (iTerm2 inline images) |
+| foot, mlterm, xterm with sixel, iTerm2 | pixel-perfect (sixel) |
+| Terminal.app, tmux without passthrough, everything else | Unicode half-block mosaic, about two pixels per cell |
+
+Other file types show a note and `e` opens them in their default application. Set `DUPSCANNER_NO_IMAGES=1` to disable the pane entirely.
 
 ## Web UI
 
@@ -93,7 +118,7 @@ HTML, SVG and script files are only ever offered as downloads, never rendered, s
 ## Commands
 
 ```
-dupscanner scan [PATH] [--json | --yolo] [scan options]
+dupscanner scan [PATH] [--json | --yolo [--rename-keepers]] [scan options]
 dupscanner serve [PATH] [--port N] [--no-open] [--scan-id ID] [scan options]
 dupscanner history [-n COUNT] [--db FILE]
 dupscanner view ID [--json | --plain] [--delete-method M] [--db FILE]

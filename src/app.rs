@@ -13,6 +13,8 @@ use crate::duplicates::DuplicateGroup;
 use crate::edits::{self, ScanEdits};
 use crate::engine::{EngineEvent, RemovedPaths, ScanSession};
 use crate::filters::GroupFilter;
+use crate::naming;
+use crate::preview::Previewer;
 use crate::scanner::{ScanConfig, ScanProgress};
 use crate::selection::{self, SelectMode};
 use crate::suggestions::{GroupAnalysis, SuggestionEngine};
@@ -82,6 +84,9 @@ pub struct App {
     pub pending_confirm: Option<PendingConfirm>,
     pub input: Option<Input>,
     pub show_mark_menu: bool,
+    /// Image preview pane beside the file list (toggle with `v`).
+    pub show_preview: bool,
+    pub previewer: Previewer,
     pub total_deleted: usize,
     pub total_freed: u64,
     pub last_report: Option<DeletionReport>,
@@ -116,6 +121,8 @@ impl App {
             pending_confirm: None,
             input: None,
             show_mark_menu: false,
+            show_preview: true,
+            previewer: Previewer::new(),
             total_deleted: 0,
             total_freed: 0,
             last_report: None,
@@ -161,6 +168,8 @@ impl App {
             pending_confirm: None,
             input: None,
             show_mark_menu: false,
+            show_preview: true,
+            previewer: Previewer::new(),
             total_deleted: 0,
             total_freed: 0,
             last_report: None,
@@ -495,6 +504,7 @@ impl App {
     fn rename(&mut self, old: &Path, new_name: &str) {
         match edits::rename_in_groups(&mut self.groups, old, new_name) {
             Ok((new, _)) => {
+                self.previewer.forget(old);
                 if self.marked.remove(old) {
                     self.marked.insert(new.clone());
                 }
@@ -508,6 +518,26 @@ impl App {
                 self.status_message = Some(format!("Renamed to {}", new.display()));
             }
             Err(e) => self.status_message = Some(format!("Not renamed: {e}")),
+        }
+    }
+
+    /// Rename the keeper of the current group to the group's canonical name
+    /// (the name with copy markers removed), when that name is free.
+    pub fn rename_keeper_to_canonical(&mut self) {
+        let Some(group) = self.current_group() else { return };
+        let Some(keeper) = SuggestionEngine::analyze(&group.files).keeper else { return };
+        match naming::suggested_rename(group, keeper) {
+            Some((path, new_name)) => self.rename(&path, &new_name),
+            None => {
+                let msg = match naming::canonical_name(group) {
+                    Some(c) if c.existing.is_some() => {
+                        format!("A copy already has the original name {}; keep that one", c.name)
+                    }
+                    Some(c) => format!("{} is taken in the keeper's folder", c.name),
+                    None => "No copy markers in this group's names, so there is no name to restore".to_string(),
+                };
+                self.status_message = Some(msg);
+            }
         }
     }
 
@@ -557,6 +587,7 @@ impl App {
         }
         for p in &deleted {
             self.marked.remove(p);
+            self.previewer.forget(p);
         }
         if self.is_scanning() {
             if let Some(removed) = &self.removed {
@@ -595,6 +626,15 @@ impl App {
     }
 
     // ----- misc -------------------------------------------------------
+
+    pub fn toggle_preview(&mut self) {
+        self.show_preview = !self.show_preview;
+        self.status_message = Some(if self.show_preview {
+            "Preview pane shown".into()
+        } else {
+            "Preview pane hidden".into()
+        });
+    }
 
     pub fn cycle_view(&mut self) {
         self.view_mode = match self.view_mode {

@@ -2,6 +2,7 @@
 //! web API.
 
 use crate::duplicates::DuplicateGroup;
+use crate::naming;
 use crate::scanner::ScanProgress;
 use crate::suggestions::{SuggestionEngine, SuggestionReason};
 use chrono::{DateTime, Utc};
@@ -25,7 +26,18 @@ pub struct GroupReport {
     pub file_size: u64,
     pub file_count: usize,
     pub wasted_space: u64,
+    /// The group's name with copy markers removed, when any member has one.
+    pub canonical_name: Option<String>,
+    /// Rename that would give the keeper the canonical name, when no
+    /// surviving copy carries it and the name is free.
+    pub suggested_rename: Option<SuggestedRename>,
     pub files: Vec<FileReport>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SuggestedRename {
+    pub path: PathBuf,
+    pub new_name: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -44,11 +56,18 @@ pub struct ScanReport {
 
 pub fn group_report(group: &DuplicateGroup) -> GroupReport {
     let analysis = SuggestionEngine::analyze(&group.files);
+    let canonical_name = naming::canonical_name(group).map(|c| c.name);
+    let suggested_rename = analysis
+        .keeper
+        .and_then(|k| naming::suggested_rename(group, k))
+        .map(|(path, new_name)| SuggestedRename { path, new_name });
     GroupReport {
         hash: group.hash.clone(),
         file_size: group.file_size(),
         file_count: group.file_count(),
         wasted_space: group.wasted_space,
+        canonical_name,
+        suggested_rename,
         files: group
             .files
             .iter()

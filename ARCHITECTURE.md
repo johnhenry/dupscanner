@@ -24,6 +24,8 @@ suggestions.rs ── scoring used by all front ends and report.rs
 | `filters.rs` | `SizeBucket`, `FileKind` and `GroupFilter`: the one definition of size buckets, file-type classes and the path substring filter, used by the TUI (`/`, `z`, `t`) and the web API (`/api/groups`, `/api/select`). |
 | `selection.rs` | `SelectMode` and the six auto-select rules. A rule owns the marks of the groups it touches and never marks every copy. The TUI applies it directly; the browser asks the server through `/api/select` so both compute identical marks. |
 | `edits.rs` | `ScanEdits` replays deletions and renames made mid-scan onto later engine snapshots; `validate_new_name` and `rename_in_groups` are the one rename path for both UIs. |
+| `naming.rs` | Copy-marker stripping (`report (1)`, `report copy`, `Copy of report`, `photo 2`) and the group's canonical name; `suggested_rename` proposes giving the keeper that name. Feeds `suggestions.rs`, `report.rs`, the TUI `N` key, the web rename button and `--rename-keepers`. Never used to decide what is a duplicate. |
+| `preview.rs` | Background image decoding with a small LRU cache for the TUI preview pane. |
 | `suggestions.rs` | `SuggestionEngine::analyze` scores each file in a group and picks the keeper. Pure function of the `FileInfo`s; used by the TUI, web UI, yolo mode and JSON report. |
 | `deletion.rs` | `plan_deletions` validates a set of paths against the current groups (must belong to a group; a group may never lose every member). `Deleter` performs removals via trash, the backup store, or permanently, re-checking file size first. `DeletionReport` carries per-file outcomes. |
 | `backup.rs` | Backup store with collision-free filenames (timestamp + short digest), an atomically written `records.json` index, restore and clean-up. |
@@ -31,7 +33,7 @@ suggestions.rs ── scoring used by all front ends and report.rs
 | `paths.rs` | The data directory and default database path. |
 | `report.rs` | Serializable `ScanReport` / `GroupReport` used by `scan --json`, `view --json` and the web API, including keeper flags and reasons. |
 | `app.rs` | Front-end-agnostic review state: current groups, selection, marks keyed by path, pending confirmation, deletion through `Deleter`, persistence to the database. |
-| `tui.rs` | ratatui rendering and key handling. Installs a panic hook that restores the terminal. All truncation is on character boundaries. |
+| `tui.rs` | ratatui rendering and key handling. Installs a panic hook that restores the terminal. All truncation is on character boundaries. `ImagePane` detects the terminal graphics protocol (kitty, sixel, iTerm2, half-block fallback) through `ratatui-image` and renders the preview. |
 | `web.rs` + `assets/` | axum server bound to 127.0.0.1 with embedded static assets, SSE progress, and JSON endpoints that mirror `report.rs`. Every file-touching endpoint canonicalizes the path, checks it is inside the scan root and belongs to a current group. |
 | `main.rs` | clap CLI. `scan` (TUI, `--json`, `--yolo`), `serve`, `history`, `view`, `forget`, `restore`, `demo`. |
 | `demo.rs` | Generates a directory tree with known duplicates for trying the tool. |
