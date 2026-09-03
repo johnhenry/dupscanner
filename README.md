@@ -84,7 +84,9 @@ Both UIs use the same rules for filtering (size buckets, file types, path substr
 
 ## Web UI
 
-`dupscanner serve PATH` scans and serves a single-page app on `http://127.0.0.1:8080` (use `--port`, or `--port 0` for a free port; `--no-open` skips launching the browser). It offers live progress, filtering by path, size and type, pagination, previews for images, video, audio, PDF and text, inline and batch rename, the same auto-select modes as the TUI, and a confirmation step before deleting. `dupscanner serve --scan-id N` serves a recorded scan instead of scanning again.
+`dupscanner serve PATH` scans and serves a single-page app on `http://127.0.0.1:8080` (use `--port`, or `--port 0` for a free port; `--no-open` skips launching the browser). It offers live progress, filtering by path, size and type, pagination, previews for images, video, audio, PDF and text, inline and batch rename, the same auto-select rules as the TUI (applied to the current page or to all matching groups, and computed by the server so the two UIs can never disagree), per-group mark and delete buttons, a confirmation dialog that lists every file, a statistics panel, and a help dialog. `dupscanner serve --scan-id N` serves a recorded scan instead of scanning again.
+
+The TUI's keyboard is available in the browser too: `j`/`k` and `n`/`p` move a cursor between files and groups, `Space` marks, `a`/`A`, `o`/`O` and `m` auto-select, `c`/`C` clear, `d`/`D` delete after confirmation, `r` renames, `Enter` previews, `/`, `z` and `t` drive the filters, `Tab` toggles statistics and `?` opens help.
 
 HTML, SVG and script files are only ever offered as downloads, never rendered, so a malicious filename or file cannot run inside the page.
 

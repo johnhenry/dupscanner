@@ -21,6 +21,9 @@ suggestions.rs ── scoring used by all front ends and report.rs
 | `scanner.rs` | `ScanConfig`, `FileInfo`, exclusion matching (`ExclusionMatcher`, compiled once, applied with `WalkDir::filter_entry` so excluded directories are never descended), the walker thread, and the two hash functions. Batches of `FileInfo` go out over a bounded `sync_channel(4)`. |
 | `duplicates.rs` | `DuplicateFinder::process_batch`: register files by size; for sizes with more than one file, quick-hash (first 64 KiB) every unhashed member in parallel; for shared quick hashes, full-hash in parallel; rebuild the affected groups from the whole size bucket. `DuplicateGroup` keeps files sorted by path so output is deterministic. |
 | `engine.rs` | `ScanSession` spawns the walker and a hasher thread that owns the `DuplicateFinder`. It emits `EngineEvent::Progress`, throttled `EngineEvent::Groups` snapshots (at most every 250 ms) and a final `EngineEvent::Complete { finder, progress, elapsed }`. `RemovedPaths` lets a front end report files it deleted mid-scan so the final result excludes them. |
+| `filters.rs` | `SizeBucket`, `FileKind` and `GroupFilter`: the one definition of size buckets, file-type classes and the path substring filter, used by the TUI (`/`, `z`, `t`) and the web API (`/api/groups`, `/api/select`). |
+| `selection.rs` | `SelectMode` and the six auto-select rules. A rule owns the marks of the groups it touches and never marks every copy. The TUI applies it directly; the browser asks the server through `/api/select` so both compute identical marks. |
+| `edits.rs` | `ScanEdits` replays deletions and renames made mid-scan onto later engine snapshots; `validate_new_name` and `rename_in_groups` are the one rename path for both UIs. |
 | `suggestions.rs` | `SuggestionEngine::analyze` scores each file in a group and picks the keeper. Pure function of the `FileInfo`s; used by the TUI, web UI, yolo mode and JSON report. |
 | `deletion.rs` | `plan_deletions` validates a set of paths against the current groups (must belong to a group; a group may never lose every member). `Deleter` performs removals via trash, the backup store, or permanently, re-checking file size first. `DeletionReport` carries per-file outcomes. |
 | `backup.rs` | Backup store with collision-free filenames (timestamp + short digest), an atomically written `records.json` index, restore and clean-up. |
@@ -47,6 +50,7 @@ suggestions.rs ── scoring used by all front ends and report.rs
 - A `DuplicateGroup` always has at least two files once exposed to a front end; empties are dropped on every mutation.
 - Files are hashed at most once per tier per scan.
 - No code path deletes a file that is not a member of a current group, and no group loses its last member through dupscanner.
+- Filtering, auto-selection, renaming and deletion have exactly one implementation each (`filters.rs`, `selection.rs`, `edits.rs`, `deletion.rs`); the TUI and the web UI are thin front ends over them.
 - The web server never binds to a non-loopback address, and never renders HTML, SVG or scripts from the scanned tree inline.
 
 ## Testing
