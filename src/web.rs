@@ -489,6 +489,14 @@ async fn api_delete(
         }
         state.deleted_this_run += report.deleted_count();
         state.bytes_freed_this_run += report.bytes_freed();
+        {
+            let method = state.deleter.method().label();
+            let scan_id = state.scan_id;
+            let root = state.root.clone();
+            if let Some(db) = state.database.as_mut() {
+                let _ = db.record_deletions(scan_id, &root, method, &report);
+            }
+        }
         if state.scan_id.is_some() {
             state.persist_groups();
         }

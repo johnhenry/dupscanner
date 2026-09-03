@@ -618,6 +618,9 @@ impl App {
                 format_size(report.bytes_freed(), BINARY)
             )
         });
+        if let Some(db) = &mut self.database {
+            let _ = db.record_deletions(self.scan_id, &self.root_path, method, &report);
+        }
         self.last_report = Some(report);
         if self.scan_complete {
             self.persist_groups();

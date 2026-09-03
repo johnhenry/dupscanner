@@ -21,6 +21,7 @@ use anyhow::{bail, Context, Result};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use colored::Colorize;
 use humansize::{format_size, BINARY};
+use std::collections::HashSet;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
@@ -112,6 +113,12 @@ enum Commands {
         /// original name when its copies carried markers like " (1)"
         #[arg(long, requires = "yolo")]
         rename_keepers: bool,
+
+        /// With --yolo: delete copies as soon as a group is confirmed instead
+        /// of after the whole scan. Safe to interrupt with Ctrl+C: files
+        /// already removed stay removed, and running again continues.
+        #[arg(long, requires = "yolo")]
+        stream: bool,
     },
 
     /// Scan a directory and review duplicates in a local web UI
@@ -224,6 +231,7 @@ fn run() -> Result<()> {
             yolo,
             json,
             rename_keepers,
+            stream,
         } => {
             if yolo && json {
                 bail!("--yolo and --json cannot be combined");
@@ -232,6 +240,8 @@ fn run() -> Result<()> {
             let (deleter, database) = build_deleter_and_db(args.delete_method.into(), args.db.clone(), args.no_record)?;
             if json {
                 scan_json(config)
+            } else if yolo && stream {
+                yolo_stream(config, deleter, database, rename_keepers)
             } else if yolo {
                 yolo_scan(config, deleter, database, rename_keepers)
             } else {
@@ -426,7 +436,7 @@ fn yolo_scan(
         None => None,
     };
 
-    let mut wanted = std::collections::HashSet::new();
+    let mut wanted = HashSet::new();
     let mut keeper_renames: Vec<(PathBuf, String)> = Vec::new();
     for group in &groups {
         let analysis = SuggestionEngine::analyze(&group.files);
@@ -458,6 +468,9 @@ fn yolo_scan(
     let report = deleter.delete_planned(&plan);
     for (path, err) in report.failures() {
         eprintln!("   {} {}: {err}", "failed".yellow().bold(), path.display());
+    }
+    if let Some(db) = database.as_mut() {
+        let _ = db.record_deletions(scan_id, &root, deleter.method().label(), &report);
     }
 
     let deleted = report.deleted_paths();
@@ -519,6 +532,257 @@ fn yolo_scan(
     Ok(())
 }
 
+
+/// Streaming yolo: delete the copies of each group as soon as the group is
+/// confirmed by full hashes, while the walk continues. Ctrl+C stops after
+/// the deletion in flight; everything removed so far stays removed, and the
+/// same command can simply be run again.
+fn yolo_stream(
+    config: ScanConfig,
+    deleter: Deleter,
+    database: Option<ScanDatabase>,
+    rename_keepers: bool,
+) -> Result<()> {
+    use crate::engine::EngineEvent;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    println!("{}", "YOLO streaming mode: delete copies as groups are confirmed".bold().bright_yellow());
+    println!("   {}: {}", "Path".bold(), config.root_path.display());
+    println!("   {}: {}", "Delete method".bold(), deleter.method().description());
+    println!("   {}", "Ctrl+C stops after the current deletion; run again later to continue.".dimmed());
+    println!();
+
+    let stop = Arc::new(AtomicBool::new(false));
+    {
+        let stop = stop.clone();
+        ctrlc::set_handler(move || {
+            if stop.swap(true, Ordering::SeqCst) {
+                eprintln!("\nQuitting now.");
+                std::process::exit(130);
+            }
+            eprintln!("\n{}", "Stopping after the current deletion… (Ctrl+C again to quit immediately)".yellow());
+        })
+        .context("could not install the Ctrl+C handler")?;
+    }
+
+    let root = config.root_path.clone();
+    let session = ScanSession::start(config);
+    let removed = session.removed_paths();
+    let mut st = StreamState {
+        root: root.clone(),
+        scan_id: None,
+        deleter,
+        database,
+        removed,
+        stop: stop.clone(),
+        edits: crate::edits::ScanEdits::default(),
+        members: std::collections::HashMap::new(),
+        groups_seen: HashSet::new(),
+        progress: crate::scanner::ScanProgress::default(),
+        total_deleted: 0,
+        total_failed: 0,
+        total_freed: 0,
+    };
+    if let Some(db) = st.database.as_mut() {
+        st.scan_id = Some(db.start_scan(&root)?);
+    }
+    let started = std::time::Instant::now();
+    let mut final_groups: Option<Vec<crate::duplicates::DuplicateGroup>> = None;
+
+    let interrupted = loop {
+        if stop.load(Ordering::SeqCst) {
+            break true;
+        }
+        match session.next_timeout(Duration::from_millis(200)) {
+            Ok(None) => continue,
+            Err(()) => break false,
+            Ok(Some(EngineEvent::Progress(p))) => {
+                st.progress = p;
+                st.print_status();
+            }
+            Ok(Some(EngineEvent::Groups(groups))) => st.handle_groups(groups),
+            Ok(Some(EngineEvent::Complete { finder, progress: p, .. })) => {
+                st.progress = p;
+                st.handle_groups(finder.groups().to_vec());
+                let mut groups = finder.groups().to_vec();
+                st.edits.apply(&mut groups);
+                final_groups = Some(groups);
+                break stop.load(Ordering::SeqCst);
+            }
+        }
+    };
+    println!();
+
+    // Rename keepers to the original name once their groups can no longer grow.
+    let mut renamed = 0usize;
+    if rename_keepers && !interrupted {
+        for (hash, all) in &st.members {
+            if !st.groups_seen.contains(hash) {
+                continue;
+            }
+            let Some(canonical) = naming::canonical_name_of(all) else { continue };
+            let survivors: Vec<&crate::scanner::FileInfo> = all.iter().filter(|f| f.path.exists()).collect();
+            let [keeper] = survivors.as_slice() else { continue };
+            let current = keeper.path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+            if current.eq_ignore_ascii_case(&canonical.name) {
+                continue;
+            }
+            let target = keeper.path.parent().unwrap_or(Path::new("")).join(&canonical.name);
+            if target.exists() {
+                continue;
+            }
+            let mut solo = vec![crate::duplicates::DuplicateGroup::new(String::new(), vec![(*keeper).clone()])];
+            match edits::rename_in_groups(&mut solo, &keeper.path, &canonical.name) {
+                Ok((new, _)) => {
+                    println!("   {} {} -> {}", "renamed".cyan().bold(), keeper.path.display(), new.display());
+                    renamed += 1;
+                }
+                Err(e) => eprintln!("   {} {}: {e}", "not renamed".yellow().bold(), keeper.path.display()),
+            }
+        }
+    }
+
+    let scan_id = st.scan_id;
+    if let (Some(db), Some(id)) = (st.database.as_mut(), scan_id) {
+        if let Some(groups) = &final_groups {
+            let _ = db.save_groups(id, groups);
+        }
+        if interrupted {
+            let _ = db.update_progress(id, st.progress.scanned_count, st.groups_seen.len());
+        } else {
+            let _ = db.complete_scan(id, st.progress.scanned_count, st.groups_seen.len());
+        }
+    }
+
+    println!();
+    if interrupted {
+        println!("{}", "Interrupted.".bold().yellow());
+    } else {
+        println!("{}", "Done.".bold().bright_green());
+    }
+    println!(
+        "   scanned {} files in {:.1}s, {} duplicate groups, deleted {} file(s), freed {}, {} failed{}",
+        st.progress.scanned_count,
+        started.elapsed().as_secs_f64(),
+        st.groups_seen.len(),
+        st.total_deleted,
+        format_size(st.total_freed, BINARY),
+        st.total_failed,
+        if renamed > 0 { format!(", renamed {renamed} keeper(s)") } else { String::new() }
+    );
+    match st.deleter.method() {
+        DeleteMethod::Trash => println!("   Files are in the system trash."),
+        DeleteMethod::Backup => println!("   Files are backed up; see `dupscanner restore list`."),
+        DeleteMethod::Permanent => {}
+    }
+    if interrupted {
+        println!("   Files already removed stay removed. Run the same command again to continue.");
+        if let Some(id) = scan_id {
+            println!("   Deletions so far are recorded under scan #{id} (`dupscanner view {id} --plain`).");
+        }
+        std::process::exit(130);
+    }
+    Ok(())
+}
+
+/// Mutable state of a streaming yolo run.
+struct StreamState {
+    root: PathBuf,
+    scan_id: Option<i64>,
+    deleter: Deleter,
+    database: Option<ScanDatabase>,
+    removed: crate::engine::RemovedPaths,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    edits: crate::edits::ScanEdits,
+    /// Every member ever seen per hash, for the original-name rename at the end.
+    members: std::collections::HashMap<String, Vec<crate::scanner::FileInfo>>,
+    groups_seen: HashSet<String>,
+    progress: crate::scanner::ScanProgress,
+    total_deleted: usize,
+    total_failed: usize,
+    total_freed: u64,
+}
+
+impl StreamState {
+    fn print_status(&self) {
+        print!(
+            "\r   scanned {} files · {} groups · {} deleted · {} freed   ",
+            self.progress.scanned_count,
+            self.groups_seen.len(),
+            self.total_deleted,
+            format_size(self.total_freed, BINARY)
+        );
+        let _ = std::io::stdout().flush();
+    }
+
+    /// Delete the copies in every confirmed group of a snapshot, keeping the
+    /// best file. A group that grows later is handled again: its keeper is
+    /// re-chosen among the survivors and the new arrivals are removed.
+    fn handle_groups(&mut self, mut groups: Vec<crate::duplicates::DuplicateGroup>) {
+        use std::sync::atomic::Ordering;
+        self.edits.apply(&mut groups);
+        for group in &groups {
+            if self.stop.load(Ordering::SeqCst) {
+                break;
+            }
+            let all = self.members.entry(group.hash.clone()).or_default();
+            for f in &group.files {
+                if !all.iter().any(|m| m.path == f.path) {
+                    all.push(f.clone());
+                }
+            }
+            let analysis = SuggestionEngine::analyze(&group.files);
+            let Some(keeper) = analysis.keeper else { continue };
+            let wanted: HashSet<PathBuf> = group
+                .files
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| *i != keeper)
+                .map(|(_, f)| f.path.clone())
+                .collect();
+            if wanted.is_empty() {
+                continue;
+            }
+            let plan = match plan_deletions(std::slice::from_ref(group), &wanted) {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!("\n   {} {e}", "skipped".yellow().bold());
+                    continue;
+                }
+            };
+            let first_time = self.groups_seen.insert(group.hash.clone());
+            let report = self.deleter.delete_planned(&plan);
+            let deleted = report.deleted_paths();
+            self.edits.record_deleted(deleted.iter().cloned());
+            self.removed.add_all(deleted.iter().cloned());
+            if let Some(db) = self.database.as_mut() {
+                let _ = db.record_deletions(self.scan_id, &self.root, self.deleter.method().label(), &report);
+            }
+            self.total_deleted += report.deleted_count();
+            self.total_failed += report.failed_count();
+            self.total_freed += report.bytes_freed();
+
+            println!(
+                "\r{} {} × {}  keeping {}{}",
+                "•".dimmed(),
+                group.file_count(),
+                format_size(group.file_size(), BINARY),
+                group.files[keeper].path.display().to_string().green(),
+                if first_time { "" } else { "  (more copies found)" }
+            );
+            for p in &deleted {
+                println!("   {} {}", "deleted".red().bold(), p.display().to_string().dimmed());
+            }
+            for (p, e) in report.failures() {
+                eprintln!("   {} {}: {e}", "failed".yellow().bold(), p.display());
+            }
+        }
+        self.print_status();
+    }
+}
+
 // ---------------------------------------------------------------------------
 
 fn show_history(count: usize, db: Option<PathBuf>) -> Result<()> {
@@ -535,8 +799,17 @@ fn show_history(count: usize, db: Option<PathBuf>) -> Result<()> {
             .map(|t| t.with_timezone(&chrono::Local).format("%Y-%m-%d %H:%M").to_string())
             .unwrap_or_default();
         let status = if scan.end_time.is_some() { "complete".green() } else { "incomplete".yellow() };
+        let deleted = if scan.deleted_count > 0 {
+            format!(
+                ", {} deleted ({})",
+                scan.deleted_count,
+                format_size(scan.deleted_bytes.max(0) as u64, BINARY)
+            )
+        } else {
+            String::new()
+        };
         println!(
-            "  {:>4}  {started}  {status:<10}  {} files, {} groups  {}",
+            "  {:>4}  {started}  {status:<10}  {} files, {} groups{deleted}  {}",
             format!("#{}", scan.id).bold(),
             scan.files_scanned,
             scan.groups_found,
@@ -598,6 +871,19 @@ fn view_scan(scan_id: i64, json: bool, plain: bool, method: DeleteMethod, db: Op
         }
         let wasted: u64 = groups.iter().map(|g| g.wasted_space).sum();
         println!("\nTotal wasted space: {}", format_size(wasted, BINARY).bright_red());
+        let deletions = db.deletions_for_scan(scan_id)?;
+        if !deletions.is_empty() {
+            println!("\n{}", format!("Deleted during this scan ({}):", deletions.len()).bold());
+            for (path, size, method, at) in deletions.iter().take(200) {
+                let when = chrono::DateTime::from_timestamp(*at, 0)
+                    .map(|t| t.with_timezone(&chrono::Local).format("%Y-%m-%d %H:%M").to_string())
+                    .unwrap_or_default();
+                println!("   {when}  {:>10}  {method:<9} {}", format_size(*size, BINARY), path.display());
+            }
+            if deletions.len() > 200 {
+                println!("   … and {} more", deletions.len() - 200);
+            }
+        }
         return Ok(());
     }
 

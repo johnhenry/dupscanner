@@ -28,6 +28,9 @@ dupscanner scan ~/Pictures --json > dupes.json
 
 # Non-interactive: keep the best copy of each group, trash the rest
 dupscanner scan ~/Downloads --yolo
+
+# Same, but delete as you go on a huge tree; Ctrl+C any time, rerun to continue
+dupscanner scan /Volumes/Archive --yolo --stream
 ```
 
 Try it on generated data first:
@@ -107,6 +110,23 @@ The preview pane (toggle with `v`) shows the selected image for JPEG, PNG, GIF, 
 
 Other file types show a note and `e` opens them in their default application. Set `DUPSCANNER_NO_IMAGES=1` to disable the pane entirely.
 
+## Unattended runs
+
+`dupscanner scan PATH --yolo` scans everything first, then keeps the best copy of each group and removes the rest. Nothing is freed until the walk finishes.
+
+`dupscanner scan PATH --yolo --stream` removes copies as soon as a group is confirmed by full hashes, while the walk continues. On a large directory space is freed from the first minute, and the run can be stopped at any time:
+
+- **Ctrl+C** finishes the deletion in flight, writes the journal, prints what was done and exits with status 130. A second Ctrl+C quits immediately.
+- **Files already removed stay removed.** There is no cache and nothing to resume; running the same command again simply walks the remaining files and continues. Re-hashing unchanged files is the only cost of a restart.
+- A group that grows after its first copies were removed is handled again: the keeper is re-chosen among the survivors by the same heuristics and the new arrivals are removed. Because members share a hash, this never loses content.
+- `--rename-keepers` still works and runs at the end, once groups can no longer grow, so it is skipped on an interrupted run.
+
+Both modes accept `--delete-method trash|backup|permanent`. Trash is the default even here.
+
+### Deletion journal
+
+Every removal made by any mode (TUI, web UI, `--yolo`, `--yolo --stream`) is written to the scan database with its path, size, method and time. `dupscanner history` shows the count and bytes per scan, including interrupted runs, and `dupscanner view ID --plain` lists the individual files. This is a record of what happened, not an undo; undo is the trash or `dupscanner restore`.
+
 ## Web UI
 
 `dupscanner serve PATH` scans and serves a single-page app on `http://127.0.0.1:8080` (use `--port`, or `--port 0` for a free port; `--no-open` skips launching the browser). It offers live progress, filtering by path, size and type, pagination, previews for images, video, audio, PDF and text, inline and batch rename, the same auto-select rules as the TUI (applied to the current page or to all matching groups, and computed by the server so the two UIs can never disagree), per-group mark and delete buttons, a confirmation dialog that lists every file, a statistics panel, and a help dialog. `dupscanner serve --scan-id N` serves a recorded scan instead of scanning again.
@@ -118,7 +138,7 @@ HTML, SVG and script files are only ever offered as downloads, never rendered, s
 ## Commands
 
 ```
-dupscanner scan [PATH] [--json | --yolo [--rename-keepers]] [scan options]
+dupscanner scan [PATH] [--json | --yolo [--stream] [--rename-keepers]] [scan options]
 dupscanner serve [PATH] [--port N] [--no-open] [--scan-id ID] [scan options]
 dupscanner history [-n COUNT] [--db FILE]
 dupscanner view ID [--json | --plain] [--delete-method M] [--db FILE]

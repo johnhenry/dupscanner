@@ -29,13 +29,13 @@ suggestions.rs ── scoring used by all front ends and report.rs
 | `suggestions.rs` | `SuggestionEngine::analyze` scores each file in a group and picks the keeper. Pure function of the `FileInfo`s; used by the TUI, web UI, yolo mode and JSON report. |
 | `deletion.rs` | `plan_deletions` validates a set of paths against the current groups (must belong to a group; a group may never lose every member). `Deleter` performs removals via trash, the backup store, or permanently, re-checking file size first. `DeletionReport` carries per-file outcomes. |
 | `backup.rs` | Backup store with collision-free filenames (timestamp + short digest), an atomically written `records.json` index, restore and clean-up. |
-| `database.rs` | SQLite (WAL) with `scans` and `files` tables. Groups are written in one transaction; `modified` and `depth` are stored so reopened scans still get sensible suggestions. Old databases are migrated in place. |
+| `database.rs` | SQLite (WAL) with `scans`, `files` and `deletions` tables. Groups are written in one transaction; `modified` and `depth` are stored so reopened scans still get sensible suggestions. `deletions` is the journal every front end appends to (`record_deletions`), including interrupted streaming runs. Old databases are migrated in place. |
 | `paths.rs` | The data directory and default database path. |
 | `report.rs` | Serializable `ScanReport` / `GroupReport` used by `scan --json`, `view --json` and the web API, including keeper flags and reasons. |
 | `app.rs` | Front-end-agnostic review state: current groups, selection, marks keyed by path, pending confirmation, deletion through `Deleter`, persistence to the database. |
 | `tui.rs` | ratatui rendering and key handling. Installs a panic hook that restores the terminal. All truncation is on character boundaries. `ImagePane` detects the terminal graphics protocol (kitty, sixel, iTerm2, half-block fallback) through `ratatui-image` and renders the preview. |
 | `web.rs` + `assets/` | axum server bound to 127.0.0.1 with embedded static assets, SSE progress, and JSON endpoints that mirror `report.rs`. Every file-touching endpoint canonicalizes the path, checks it is inside the scan root and belongs to a current group. |
-| `main.rs` | clap CLI. `scan` (TUI, `--json`, `--yolo`), `serve`, `history`, `view`, `forget`, `restore`, `demo`. |
+| `main.rs` | clap CLI. `scan` (TUI, `--json`, `--yolo`, `--yolo --stream`), `serve`, `history`, `view`, `forget`, `restore`, `demo`. `yolo_stream` consumes engine snapshots as they arrive, replays its own deletions through `ScanEdits`, deletes per confirmed group, and stops cleanly on Ctrl+C (`ctrlc`). |
 | `demo.rs` | Generates a directory tree with known duplicates for trying the tool. |
 
 ## Data flow for a scan

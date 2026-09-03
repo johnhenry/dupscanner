@@ -88,6 +88,16 @@ impl ScanSession {
         self.events.recv().ok()
     }
 
+    /// Wait up to `timeout` for the next event. `Ok(None)` on timeout,
+    /// `Err(())` once the engine is gone.
+    pub fn next_timeout(&self, timeout: Duration) -> Result<Option<EngineEvent>, ()> {
+        match self.events.recv_timeout(timeout) {
+            Ok(ev) => Ok(Some(ev)),
+            Err(mpsc::RecvTimeoutError::Timeout) => Ok(None),
+            Err(mpsc::RecvTimeoutError::Disconnected) => Err(()),
+        }
+    }
+
     /// Run to completion, ignoring intermediate snapshots. Useful for
     /// non-interactive modes. Calls `on_progress` for each progress event.
     pub fn run_to_completion<F: FnMut(&ScanProgress, usize)>(
